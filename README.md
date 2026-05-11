@@ -28,9 +28,9 @@ Proje **iteratif ve inkremental geliştirme modeli** ile yürütülmektedir. Sı
 ### İterasyon 1 — Temel Kolon Tabanlı Depolama
 - [x] Tablo şeması tanımı (kolon adı + tip)
 - [x] Kolon bazlı bellek içi yazma tamponu (write buffer)
-- [ ] Disk üzerinde segment formatı (binary, kolon başına ayrı blok)
-- [ ] Run-Length Encoding (RLE) sıkıştırması
-- [ ] Segment okuma ve kolon-seçimli scan
+- [x] Disk üzerinde segment formatı (binary, kolon başına ayrı blok)
+- [x] Run-Length Encoding (RLE) sıkıştırması
+- [x] Segment okuma ve kolon-seçimli scan
 
 ### İterasyon 2 — Tekil Kayıt Katmanı
 - [ ] Bloom filter implementasyonu (parametrik FPR)
