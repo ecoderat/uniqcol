@@ -5,10 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/ecoderat/uniqcol/bloom"
 )
 
 // fixtureSchema returns the schema used by the end-to-end segment tests.
@@ -56,7 +59,7 @@ func buildFixture(t *testing.T, n int) (*WriteBuffer, []int64, []float64, []stri
 func TestSegmentRoundTripInMemory(t *testing.T) {
 	buf, ids, amounts, countries, tags := buildFixture(t, 100)
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, fixtureSchema(), buf); err != nil {
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 
@@ -111,7 +114,7 @@ func TestSegmentRoundTripFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := WriteSegment(f, fixtureSchema(), buf); err != nil {
+	if err := WriteSegment(f, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
 		_ = f.Close()
 		t.Fatalf("WriteSegment: %v", err)
 	}
@@ -151,7 +154,7 @@ func TestSegmentRoundTripFile(t *testing.T) {
 func TestSegmentColumnPruning(t *testing.T) {
 	buf, _, _, _, _ := buildFixture(t, 30)
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, fixtureSchema(), buf); err != nil {
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	seg, err := parseSegment(bb.Bytes())
@@ -202,7 +205,7 @@ func TestSegmentEmptyBuffer(t *testing.T) {
 	schema := Schema{PK: "id", Columns: []Column{{Name: "id", Type: Int64}}}
 	buf := NewWriteBuffer(schema)
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, schema, buf); err != nil {
+	if err := WriteSegment(&bb, schema, buf, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	seg, err := parseSegment(bb.Bytes())
@@ -224,7 +227,7 @@ func TestSegmentEmptyBuffer(t *testing.T) {
 func TestReadSegmentHeader(t *testing.T) {
 	buf, _, _, _, _ := buildFixture(t, 12)
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, fixtureSchema(), buf); err != nil {
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	schema, rowCount, err := ReadSegmentHeader(bytes.NewReader(bb.Bytes()))
@@ -254,7 +257,7 @@ func validSegmentBytes(t *testing.T) []byte {
 	t.Helper()
 	buf, _, _, _, _ := buildFixture(t, 5)
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, fixtureSchema(), buf); err != nil {
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	return bb.Bytes()
@@ -327,13 +330,14 @@ func TestSegmentBadEncoding(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, schema, b); err != nil {
+	if err := WriteSegment(&bb, schema, b, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	data := bb.Bytes()
-	// Layout for 1 column named "id": header(16) | nameLen=1 | "id"(2) | wireType | encoding | payloadLen | payload
-	// nameLen is uvarint of 2 → 1 byte. Name "id" → 2 bytes. wireType at 16+1+2=19, encoding at 20.
-	data[20] = 0xEE
+	// V2 layout for 1 column named "id" with empty opts:
+	//   header(16) | flagsLen=1(1) | flags=0(1) | nameLen=2(1) | "id"(2) | wireType(1) | encoding(1) | ...
+	// So wireType is at offset 21 and encoding at 22.
+	data[22] = 0xEE
 	if _, err := parseSegment(data); err == nil {
 		t.Fatalf("expected error for unknown encoding")
 	}
@@ -374,17 +378,237 @@ func TestSegmentBadWireColumnType(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 	var bb bytes.Buffer
-	if err := WriteSegment(&bb, schema, b); err != nil {
+	if err := WriteSegment(&bb, schema, b, WriteSegmentOpts{}); err != nil {
 		t.Fatalf("WriteSegment: %v", err)
 	}
 	data := bb.Bytes()
-	// wireType byte is at offset 19 (see TestSegmentBadEncoding).
-	data[19] = 0xEE
+	// wireType byte is at offset 21 in v2 (see TestSegmentBadEncoding).
+	data[21] = 0xEE
 	if _, err := parseSegment(data); err == nil {
 		t.Fatalf("expected error for unknown wire column type")
 	}
 	// Also exercise ReadSegmentHeader's branch.
 	if _, _, err := ReadSegmentHeader(bytes.NewReader(data)); err == nil {
 		t.Fatalf("expected ReadSegmentHeader error for unknown wire column type")
+	}
+}
+
+// writeV1Segment emits the Iteration 1 (legacy) wire format directly:
+// 16-byte header with version=1, then column blocks. No flags block, no
+// Bloom trailer. Used to verify v1 read-compatibility.
+func writeV1Segment(t *testing.T, w io.Writer, schema Schema, buf *WriteBuffer) {
+	t.Helper()
+	var hdr [segmentHeaderLen]byte
+	copy(hdr[0:4], segmentMagic)
+	binary.LittleEndian.PutUint16(hdr[4:6], segmentVersionV1)
+	binary.LittleEndian.PutUint16(hdr[6:8], uint16(len(schema.Columns)))
+	binary.LittleEndian.PutUint64(hdr[8:16], uint64(buf.Len()))
+	if _, err := w.Write(hdr[:]); err != nil {
+		t.Fatalf("v1 hdr: %v", err)
+	}
+	var ub [binary.MaxVarintLen64]byte
+	for i, c := range schema.Columns {
+		var payload []byte
+		switch c.Type {
+		case Int64:
+			payload = encodeRLEInt64(buf.int64Cols[i])
+		case Float64:
+			payload = encodeRLEFloat64(buf.float64Cols[i])
+		case String:
+			payload = encodeRLEString(buf.stringCols[i])
+		}
+		wire, _ := columnTypeToWire(c.Type)
+		n := binary.PutUvarint(ub[:], uint64(len(c.Name)))
+		_, _ = w.Write(ub[:n])
+		_, _ = io.WriteString(w, c.Name)
+		_, _ = w.Write([]byte{wire, byte(EncodingRLE)})
+		n = binary.PutUvarint(ub[:], uint64(len(payload)))
+		_, _ = w.Write(ub[:n])
+		_, _ = w.Write(payload)
+	}
+}
+
+func TestSegmentV1ReadCompatibility(t *testing.T) {
+	buf, ids, _, countries, _ := buildFixture(t, 20)
+	var bb bytes.Buffer
+	writeV1Segment(t, &bb, fixtureSchema(), buf)
+
+	seg, err := parseSegment(bb.Bytes())
+	if err != nil {
+		t.Fatalf("parseSegment v1: %v", err)
+	}
+	defer seg.Close()
+
+	if seg.Version() != segmentVersionV1 {
+		t.Fatalf("version = %d; want %d", seg.Version(), segmentVersionV1)
+	}
+	if seg.PKName() != "" {
+		t.Fatalf("v1 PKName = %q; want \"\"", seg.PKName())
+	}
+	if seg.Bloom() != nil {
+		t.Fatalf("v1 should have no Bloom filter")
+	}
+	if seg.Schema().PK != "" {
+		t.Fatalf("v1 Schema.PK = %q; want \"\"", seg.Schema().PK)
+	}
+
+	gotIDs, err := seg.ReadColumn("id")
+	if err != nil {
+		t.Fatalf("read id: %v", err)
+	}
+	if !reflect.DeepEqual(gotIDs.([]int64), ids) {
+		t.Fatalf("id mismatch")
+	}
+	gotCountries, err := seg.ReadColumn("country")
+	if err != nil {
+		t.Fatalf("read country: %v", err)
+	}
+	if !reflect.DeepEqual(gotCountries.([]string), countries) {
+		t.Fatalf("country mismatch")
+	}
+
+	// ReadSegmentHeader on v1 should also succeed.
+	schema, rowCount, err := ReadSegmentHeader(bytes.NewReader(bb.Bytes()))
+	if err != nil {
+		t.Fatalf("ReadSegmentHeader v1: %v", err)
+	}
+	if rowCount != 20 {
+		t.Fatalf("rowCount = %d; want 20", rowCount)
+	}
+	if schema.PK != "" {
+		t.Fatalf("v1 ReadSegmentHeader returned PK %q; want \"\"", schema.PK)
+	}
+}
+
+func TestSegmentV2WithPKAndBloom(t *testing.T) {
+	buf, ids, _, _, _ := buildFixture(t, 25)
+	bf, err := bloom.New(1000, 0.01)
+	if err != nil {
+		t.Fatalf("bloom.New: %v", err)
+	}
+	for _, id := range ids {
+		var keyBuf [8]byte
+		binary.LittleEndian.PutUint64(keyBuf[:], uint64(id))
+		bf.Add(keyBuf[:])
+	}
+
+	var bb bytes.Buffer
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{
+		PKName: "id",
+		Bloom:  bf,
+	}); err != nil {
+		t.Fatalf("WriteSegment: %v", err)
+	}
+
+	seg, err := parseSegment(bb.Bytes())
+	if err != nil {
+		t.Fatalf("parseSegment: %v", err)
+	}
+	defer seg.Close()
+
+	if seg.Version() != segmentVersionV2 {
+		t.Fatalf("version = %d; want %d", seg.Version(), segmentVersionV2)
+	}
+	if seg.PKName() != "id" {
+		t.Fatalf("PKName = %q; want \"id\"", seg.PKName())
+	}
+	if seg.Schema().PK != "id" {
+		t.Fatalf("Schema().PK = %q; want \"id\"", seg.Schema().PK)
+	}
+	if seg.Bloom() == nil {
+		t.Fatalf("expected non-nil Bloom filter")
+	}
+
+	// Loaded BF must still flag inserted PKs.
+	for _, id := range ids {
+		var keyBuf [8]byte
+		binary.LittleEndian.PutUint64(keyBuf[:], uint64(id))
+		if !seg.Bloom().Contains(keyBuf[:]) {
+			t.Fatalf("loaded BF lost id %d (false negative)", id)
+		}
+	}
+}
+
+func TestSegmentV2WithPKNoBloom(t *testing.T) {
+	buf, _, _, _, _ := buildFixture(t, 5)
+	var bb bytes.Buffer
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{
+		PKName: "id",
+	}); err != nil {
+		t.Fatalf("WriteSegment: %v", err)
+	}
+	seg, err := parseSegment(bb.Bytes())
+	if err != nil {
+		t.Fatalf("parseSegment: %v", err)
+	}
+	defer seg.Close()
+	if seg.PKName() != "id" {
+		t.Fatalf("PKName = %q; want \"id\"", seg.PKName())
+	}
+	if seg.Bloom() != nil {
+		t.Fatalf("Bloom should be nil when not opted in")
+	}
+}
+
+func TestSegmentBloomTrailerCorruption(t *testing.T) {
+	buf, _, _, _, _ := buildFixture(t, 3)
+	bf, _ := bloom.New(100, 0.01)
+	bf.Add([]byte("x"))
+
+	var bb bytes.Buffer
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{
+		PKName: "id",
+		Bloom:  bf,
+	}); err != nil {
+		t.Fatalf("WriteSegment: %v", err)
+	}
+	good := bb.Bytes()
+
+	t.Run("bad trailer magic", func(t *testing.T) {
+		data := bytes.Clone(good)
+		// Find UBLM by scanning right-to-left; corrupt first byte.
+		idx := bytes.Index(data, []byte(bloomTrailerMagic))
+		if idx < 0 {
+			t.Fatalf("trailer magic not found in test fixture")
+		}
+		data[idx] = 'X'
+		if _, err := parseSegment(data); !errors.Is(err, ErrBadBloomMagic) {
+			t.Fatalf("err = %v; want ErrBadBloomMagic", err)
+		}
+	})
+
+	t.Run("unsupported trailer version", func(t *testing.T) {
+		data := bytes.Clone(good)
+		idx := bytes.Index(data, []byte(bloomTrailerMagic))
+		// 2-byte trailer version sits right after the magic.
+		binary.LittleEndian.PutUint16(data[idx+4:idx+6], 99)
+		if _, err := parseSegment(data); !errors.Is(err, ErrUnsupportedBloomVersion) {
+			t.Fatalf("err = %v; want ErrUnsupportedBloomVersion", err)
+		}
+	})
+
+	t.Run("truncated trailer", func(t *testing.T) {
+		idx := bytes.Index(good, []byte(bloomTrailerMagic))
+		// Cut off mid-trailer (drop the last 4 bytes of the bloom body).
+		if _, err := parseSegment(good[:idx+6+4]); err == nil {
+			t.Fatalf("expected error on truncated trailer")
+		}
+	})
+
+	t.Run("missing trailer header", func(t *testing.T) {
+		// Cut right after the last column payload — bloom flag set but no
+		// trailer bytes at all.
+		idx := bytes.Index(good, []byte(bloomTrailerMagic))
+		if _, err := parseSegment(good[:idx]); !errors.Is(err, ErrTruncated) {
+			t.Fatalf("err = %v; want ErrTruncated", err)
+		}
+	})
+}
+
+func TestSegmentUnsupportedFutureVersion(t *testing.T) {
+	data := validSegmentBytes(t)
+	binary.LittleEndian.PutUint16(data[4:6], 99) // version > 2
+	if _, err := parseSegment(data); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("err = %v; want ErrUnsupportedVersion", err)
 	}
 }

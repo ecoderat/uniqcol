@@ -33,10 +33,10 @@ Proje **iteratif ve inkremental geliştirme modeli** ile yürütülmektedir. Sı
 - [x] Segment okuma ve kolon-seçimli scan
 
 ### İterasyon 2 — Tekil Kayıt Katmanı
-- [ ] Bloom filter implementasyonu (parametrik FPR)
-- [ ] Yazma yoluna entegrasyon: `Insert(row)` → BF kontrolü → kabul/red
-- [ ] Birincil anahtar (primary key) konfigürasyonu
-- [ ] Yapılandırma: `expectedItems`, `targetFPR`
+- [x] Bloom filter implementasyonu (parametrik FPR)
+- [x] Yazma yoluna entegrasyon: `Insert(row)` → BF kontrolü → kabul/red
+- [x] Birincil anahtar (primary key) konfigürasyonu
+- [x] Yapılandırma: `expectedItems`, `targetFPR`
 
 ### İterasyon 3 — Sorgu ve Değerlendirme
 - [ ] CLI: `load <csv>`, `query <sql-benzeri>`

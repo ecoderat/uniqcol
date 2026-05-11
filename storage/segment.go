@@ -7,32 +7,50 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/ecoderat/uniqcol/bloom"
 )
 
 // Segment wire constants.
 const (
-	segmentMagic            = "UCOL"
-	segmentVersion   uint16 = 1
-	segmentHeaderLen        = 16 // 4 magic + 2 version + 2 colCount + 8 rowCount
+	segmentMagic     = "UCOL"
+	segmentVersionV1 = uint16(1)
+	segmentVersionV2 = uint16(2)
+	// segmentCurrentVersion is what WriteSegment emits. v1 is read-only.
+	segmentCurrentVersion = segmentVersionV2
+	segmentHeaderLen      = 16 // 4 magic + 2 version + 2 colCount + 8 rowCount
+
+	bloomTrailerMagic   = "UBLM"
+	bloomTrailerVersion = uint16(1)
 )
 
-// Sentinel errors returned by the segment reader. Distinguishable with errors.Is.
+// Flag bits set in the v2 flags block.
+const (
+	flagHasPKName uint8 = 1 << 0
+	flagHasBloom  uint8 = 1 << 1
+)
+
+// Sentinel errors. Distinguishable with errors.Is.
 var (
-	// ErrBadMagic indicates the file does not start with the expected magic bytes.
+	// ErrBadMagic indicates the file does not start with the expected segment magic.
 	ErrBadMagic = errors.New("segment: bad magic bytes")
 	// ErrUnsupportedVersion indicates a segment version this build does not understand.
+	// v1 (read-only) and v2 are accepted; v >= 3 returns this error.
 	ErrUnsupportedVersion = errors.New("segment: unsupported version")
 	// ErrTruncated indicates the segment ended before all advertised data was read.
 	ErrTruncated = errors.New("segment: truncated input")
 	// ErrUnknownColumn indicates a requested column name is not in the segment.
 	ErrUnknownColumn = errors.New("segment: unknown column")
+	// ErrBadBloomMagic indicates the Bloom trailer does not start with "UBLM".
+	ErrBadBloomMagic = errors.New("segment: bad bloom trailer magic")
+	// ErrUnsupportedBloomVersion indicates a Bloom trailer this build does not understand.
+	ErrUnsupportedBloomVersion = errors.New("segment: unsupported bloom trailer version")
 )
 
-// Wire-level ColumnType tags. These are intentionally distinct from the
-// in-memory ColumnType constants in types.go (which use iota+1 so 0
-// remains a zero-value sentinel). All ColumnType <-> wire conversion
-// goes through columnTypeToWire / wireToColumnType to keep the two
-// representations decoupled.
+// Wire-level ColumnType tags. Intentionally distinct from the in-memory
+// ColumnType constants in types.go (which use iota+1 so 0 remains a
+// zero-value sentinel). All ColumnType <-> wire conversion goes through
+// columnTypeToWire / wireToColumnType.
 const (
 	wireTypeInt64   uint8 = 0
 	wireTypeFloat64 uint8 = 1
@@ -78,24 +96,35 @@ type columnBlock struct {
 // are decoded lazily on first ReadColumn and cached. Not safe for
 // concurrent use.
 //
-// The Schema returned by Schema() does NOT carry a PK: the segment wire
-// format does not persist PK. Callers that need PK should supply it
-// from configuration. Schema.Validate will therefore fail on a
-// segment-loaded Schema with the original PK absent.
+// v1 segments (legacy, Iteration 1) carry no PK name and no Bloom
+// trailer; PKName() returns "" and Bloom() returns nil. Schema.Validate
+// will fail on such a schema because PK is absent — use OpenSegment for
+// read-only column scans on v1 files. LoadTable refuses v1.
 type Segment struct {
-	schema   Schema
-	rowCount uint64
-	raw      []byte
-	blocks   map[string]columnBlock
-	decoded  map[string]any
+	version     uint16
+	schema      Schema
+	rowCount    uint64
+	raw         []byte
+	blocks      map[string]columnBlock
+	decoded     map[string]any
+	flags       uint8
+	pkName      string
+	bloomFilter *bloom.Filter
 }
 
-// WriteSegment serializes the buffer to w in the segment wire format
-// described in the README ("Veri Formatı"). It does NOT close w.
-//
-// The PK is not persisted; segment readers will return a Schema with
-// an empty PK.
-func WriteSegment(w io.Writer, schema Schema, buf *WriteBuffer) error {
+// WriteSegmentOpts holds optional v2 features. A zero value writes a
+// minimal v2 segment with no PK name and no Bloom trailer (flags = 0).
+type WriteSegmentOpts struct {
+	// PKName, if non-empty, is persisted in the flags block so LoadTable
+	// can rebuild a Schema with the right PK.
+	PKName string
+	// Bloom, if non-nil, is appended as a trailer.
+	Bloom *bloom.Filter
+}
+
+// WriteSegment serializes buf to w in the v2 wire format. Does NOT
+// close w. Iteration 1 (v1) is read-only; new writes always emit v2.
+func WriteSegment(w io.Writer, schema Schema, buf *WriteBuffer, opts WriteSegmentOpts) error {
 	if len(schema.Columns) > 0xFFFF {
 		return fmt.Errorf("segment: too many columns (%d)", len(schema.Columns))
 	}
@@ -103,14 +132,39 @@ func WriteSegment(w io.Writer, schema Schema, buf *WriteBuffer) error {
 
 	var hdr [segmentHeaderLen]byte
 	copy(hdr[0:4], segmentMagic)
-	binary.LittleEndian.PutUint16(hdr[4:6], segmentVersion)
+	binary.LittleEndian.PutUint16(hdr[4:6], segmentCurrentVersion)
 	binary.LittleEndian.PutUint16(hdr[6:8], uint16(len(schema.Columns)))
 	binary.LittleEndian.PutUint64(hdr[8:16], rowCount)
 	if _, err := w.Write(hdr[:]); err != nil {
 		return fmt.Errorf("segment: write header: %w", err)
 	}
 
+	var flags uint8
+	if opts.PKName != "" {
+		flags |= flagHasPKName
+	}
+	if opts.Bloom != nil {
+		flags |= flagHasBloom
+	}
 	var ub [binary.MaxVarintLen64]byte
+	// flagsLen = 1 (one flags byte); future versions can grow the field.
+	n := binary.PutUvarint(ub[:], 1)
+	if _, err := w.Write(ub[:n]); err != nil {
+		return fmt.Errorf("segment: write flagsLen: %w", err)
+	}
+	if _, err := w.Write([]byte{flags}); err != nil {
+		return fmt.Errorf("segment: write flags: %w", err)
+	}
+	if flags&flagHasPKName != 0 {
+		n = binary.PutUvarint(ub[:], uint64(len(opts.PKName)))
+		if _, err := w.Write(ub[:n]); err != nil {
+			return fmt.Errorf("segment: write pkName length: %w", err)
+		}
+		if _, err := io.WriteString(w, opts.PKName); err != nil {
+			return fmt.Errorf("segment: write pkName: %w", err)
+		}
+	}
+
 	for i, c := range schema.Columns {
 		var (
 			payload  []byte
@@ -168,13 +222,31 @@ func WriteSegment(w io.Writer, schema Schema, buf *WriteBuffer) error {
 			return fmt.Errorf("segment: write column %q payload: %w", c.Name, err)
 		}
 	}
+
+	if opts.Bloom != nil {
+		if _, err := io.WriteString(w, bloomTrailerMagic); err != nil {
+			return fmt.Errorf("segment: write bloom magic: %w", err)
+		}
+		var vbuf [2]byte
+		binary.LittleEndian.PutUint16(vbuf[:], bloomTrailerVersion)
+		if _, err := w.Write(vbuf[:]); err != nil {
+			return fmt.Errorf("segment: write bloom version: %w", err)
+		}
+		body, err := opts.Bloom.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("segment: marshal bloom: %w", err)
+		}
+		if _, err := w.Write(body); err != nil {
+			return fmt.Errorf("segment: write bloom body: %w", err)
+		}
+	}
 	return nil
 }
 
-// ReadSegmentHeader reads the file header and per-column metadata from
-// r, skipping over column payloads. It returns the reconstructed schema
-// (with empty PK; see Segment) and the segment's row count. The reader
-// is left positioned just after the last column payload.
+// ReadSegmentHeader reads the file header (and v2 flags block) and
+// per-column metadata from r, skipping over column payloads and the
+// Bloom trailer if any. Returns the reconstructed schema (PK populated
+// only if the segment carries a PK name) and the row count.
 func ReadSegmentHeader(r io.Reader) (Schema, uint64, error) {
 	br := bufio.NewReader(r)
 
@@ -189,13 +261,39 @@ func ReadSegmentHeader(r io.Reader) (Schema, uint64, error) {
 		return Schema{}, 0, fmt.Errorf("%w: got %q, want %q", ErrBadMagic, hdr[0:4], segmentMagic)
 	}
 	version := binary.LittleEndian.Uint16(hdr[4:6])
-	if version != segmentVersion {
-		return Schema{}, 0, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedVersion, version, segmentVersion)
+	if version != segmentVersionV1 && version != segmentVersionV2 {
+		return Schema{}, 0, fmt.Errorf("%w: got %d, supported {1, 2}", ErrUnsupportedVersion, version)
 	}
 	columnCount := int(binary.LittleEndian.Uint16(hdr[6:8]))
 	rowCount := binary.LittleEndian.Uint64(hdr[8:16])
-
 	schema := Schema{Columns: make([]Column, 0, columnCount)}
+
+	if version == segmentVersionV2 {
+		flagsLen, err := binary.ReadUvarint(br)
+		if err != nil {
+			return Schema{}, 0, fmt.Errorf("%w: flagsLen", ErrTruncated)
+		}
+		if flagsLen == 0 {
+			return Schema{}, 0, fmt.Errorf("segment: v2 flagsLen must be >= 1")
+		}
+		flagsBuf := make([]byte, flagsLen)
+		if _, err := io.ReadFull(br, flagsBuf); err != nil {
+			return Schema{}, 0, fmt.Errorf("%w: flags payload", ErrTruncated)
+		}
+		flags := flagsBuf[0]
+		if flags&flagHasPKName != 0 {
+			nameLen, err := binary.ReadUvarint(br)
+			if err != nil {
+				return Schema{}, 0, fmt.Errorf("%w: pkName length", ErrTruncated)
+			}
+			nameBuf := make([]byte, nameLen)
+			if _, err := io.ReadFull(br, nameBuf); err != nil {
+				return Schema{}, 0, fmt.Errorf("%w: pkName", ErrTruncated)
+			}
+			schema.PK = string(nameBuf)
+		}
+	}
+
 	for i := range columnCount {
 		nameLen, err := binary.ReadUvarint(br)
 		if err != nil {
@@ -226,11 +324,11 @@ func ReadSegmentHeader(r io.Reader) (Schema, uint64, error) {
 }
 
 // OpenSegment reads the segment file at path into memory and parses its
-// header and per-column metadata. Column payloads are not decoded until
-// ReadColumn is called.
+// header, optional flags / PK name, per-column metadata, and optional
+// Bloom trailer. Column payloads are not decoded until ReadColumn.
 //
-// TODO: switch to mmap or windowed reads when segment sizes grow beyond
-// what we want to load eagerly.
+// TODO: switch to mmap or windowed reads when segments grow beyond what
+// we want to load eagerly.
 func OpenSegment(path string) (*Segment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -239,8 +337,6 @@ func OpenSegment(path string) (*Segment, error) {
 	return parseSegment(data)
 }
 
-// parseSegment parses an in-memory segment image. It is the shared
-// implementation behind OpenSegment and is used directly by tests.
 func parseSegment(data []byte) (*Segment, error) {
 	if len(data) < segmentHeaderLen {
 		return nil, fmt.Errorf("%w: file shorter than header (%d bytes)", ErrTruncated, len(data))
@@ -249,13 +345,14 @@ func parseSegment(data []byte) (*Segment, error) {
 		return nil, fmt.Errorf("%w: got %q, want %q", ErrBadMagic, data[0:4], segmentMagic)
 	}
 	version := binary.LittleEndian.Uint16(data[4:6])
-	if version != segmentVersion {
-		return nil, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedVersion, version, segmentVersion)
+	if version != segmentVersionV1 && version != segmentVersionV2 {
+		return nil, fmt.Errorf("%w: got %d, supported {1, 2}", ErrUnsupportedVersion, version)
 	}
 	columnCount := int(binary.LittleEndian.Uint16(data[6:8]))
 	rowCount := binary.LittleEndian.Uint64(data[8:16])
 
 	s := &Segment{
+		version:  version,
 		rowCount: rowCount,
 		raw:      data,
 		blocks:   make(map[string]columnBlock, columnCount),
@@ -264,6 +361,36 @@ func parseSegment(data []byte) (*Segment, error) {
 	s.schema.Columns = make([]Column, 0, columnCount)
 
 	offset := segmentHeaderLen
+
+	if version == segmentVersionV2 {
+		flagsLen, n := binary.Uvarint(data[offset:])
+		if n <= 0 {
+			return nil, fmt.Errorf("%w: flagsLen at offset %d", ErrTruncated, offset)
+		}
+		offset += n
+		if flagsLen == 0 {
+			return nil, fmt.Errorf("segment: v2 flagsLen must be >= 1")
+		}
+		if flagsLen > uint64(len(data)-offset) {
+			return nil, fmt.Errorf("%w: flags payload (need %d bytes)", ErrTruncated, flagsLen)
+		}
+		s.flags = data[offset]
+		offset += int(flagsLen)
+		if s.flags&flagHasPKName != 0 {
+			nameLen, n := binary.Uvarint(data[offset:])
+			if n <= 0 {
+				return nil, fmt.Errorf("%w: pkName length at offset %d", ErrTruncated, offset)
+			}
+			offset += n
+			if nameLen > uint64(len(data)-offset) {
+				return nil, fmt.Errorf("%w: pkName (need %d bytes)", ErrTruncated, nameLen)
+			}
+			s.pkName = string(data[offset : offset+int(nameLen)])
+			s.schema.PK = s.pkName
+			offset += int(nameLen)
+		}
+	}
+
 	for i := range columnCount {
 		nameLen, n := binary.Uvarint(data[offset:])
 		if n <= 0 {
@@ -307,15 +434,49 @@ func parseSegment(data []byte) (*Segment, error) {
 		}
 		offset += int(payloadLen)
 	}
+
+	if version == segmentVersionV2 && s.flags&flagHasBloom != 0 {
+		const trailerHeader = 4 + 2 // magic + version
+		if len(data)-offset < trailerHeader {
+			return nil, fmt.Errorf("%w: bloom trailer header", ErrTruncated)
+		}
+		if string(data[offset:offset+4]) != bloomTrailerMagic {
+			return nil, fmt.Errorf("%w: got %q, want %q", ErrBadBloomMagic, data[offset:offset+4], bloomTrailerMagic)
+		}
+		offset += 4
+		bv := binary.LittleEndian.Uint16(data[offset : offset+2])
+		offset += 2
+		if bv != bloomTrailerVersion {
+			return nil, fmt.Errorf("%w: got %d, want %d", ErrUnsupportedBloomVersion, bv, bloomTrailerVersion)
+		}
+		var bf bloom.Filter
+		if err := bf.UnmarshalBinary(data[offset:]); err != nil {
+			return nil, fmt.Errorf("segment: bloom trailer: %w", err)
+		}
+		s.bloomFilter = &bf
+	}
+
 	return s, nil
 }
 
-// Schema returns the schema reconstructed from the segment header.
-// The PK field is empty; see Segment doc.
+// Version returns the segment's wire-format version (1 or 2).
+func (s *Segment) Version() uint16 { return s.version }
+
+// Schema returns the schema reconstructed from the segment. PK is set
+// only if a PK name was persisted (v2 with flagHasPKName); v1 segments
+// have PK == "".
 func (s *Segment) Schema() Schema { return s.schema }
 
 // RowCount returns the number of rows stored in the segment.
 func (s *Segment) RowCount() uint64 { return s.rowCount }
+
+// PKName returns the segment's PK column name, or "" if not present.
+func (s *Segment) PKName() string { return s.pkName }
+
+// Bloom returns the segment's Bloom filter, or nil if no trailer was
+// present. The returned filter is owned by the Segment and should not
+// be mutated by callers (LoadTable hands it off to a new Table).
+func (s *Segment) Bloom() *bloom.Filter { return s.bloomFilter }
 
 // ReadColumn decodes and returns the named column. The concrete return
 // type is []int64, []float64, or []string depending on the column's
@@ -372,5 +533,6 @@ func (s *Segment) Close() error {
 	s.raw = nil
 	s.blocks = nil
 	s.decoded = nil
+	s.bloomFilter = nil
 	return nil
 }
