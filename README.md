@@ -26,8 +26,8 @@ Bu repo, **Yazılım Mühendisliği yüksek lisans dersi proje ödevi** kapsamı
 Proje **iteratif ve inkremental geliştirme modeli** ile yürütülmektedir. Sınırlı süre nedeniyle kapsam bilinçli olarak daraltılmıştır; ölçülebilir ve tutarlı sonuçlar üretmek, geniş ama yarım bir motor üretmekten önceliklidir.
 
 ### İterasyon 1 — Temel Kolon Tabanlı Depolama
-- [ ] Tablo şeması tanımı (kolon adı + tip)
-- [ ] Kolon bazlı bellek içi yazma tamponu (write buffer)
+- [x] Tablo şeması tanımı (kolon adı + tip)
+- [x] Kolon bazlı bellek içi yazma tamponu (write buffer)
 - [ ] Disk üzerinde segment formatı (binary, kolon başına ayrı blok)
 - [ ] Run-Length Encoding (RLE) sıkıştırması
 - [ ] Segment okuma ve kolon-seçimli scan
