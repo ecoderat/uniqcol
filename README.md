@@ -39,7 +39,7 @@ Proje **iteratif ve inkremental geliştirme modeli** ile yürütülmektedir. Sı
 - [x] Yapılandırma: `expectedItems`, `targetFPR`
 
 ### İterasyon 3 — Sorgu ve Değerlendirme
-- [ ] CLI: `load <csv>`, `query <sql-benzeri>`
+- [x] CLI: `load <csv>`, `inspect <segment>` (sorgu motoru aşağıda)
 - [ ] `SELECT col1, col2 WHERE col = X` desteği
 - [ ] `COUNT`, `SUM` aggregation
 - [ ] Benchmark suite + sonuç grafikleri
@@ -59,25 +59,42 @@ cd uniqcol
 go build -o uniqcol ./cmd/uniqcol
 ```
 
-### Demo: CSV Yükle ve Sorgu Çalıştır
+### Demo: CSV Yükle ve Segmenti İncele
 
 ```bash
 # 1. Örnek CSV'yi yükle (yinelenen kayıtlar dahil)
-./uniqcol load --csv testdata/events.csv --pk event_id --out data/events.uniq
+./uniqcol load \
+  --csv testdata/events.csv \
+  --out data/events.uniq \
+  --pk event_id \
+  --schema event_id:int64,user_id:int64,amount:float64,country:string \
+  --expected-items 1000000 \
+  --target-fpr 0.01
 
-# Beklenen çıktı:
-#   yüklenen satır: 100000
-#   kabul edilen:    97843
-#   reddedilen (BF): 2157   (%2.16 yinelenen)
-#   süre:           1.42s
+# Beklenen çıktı (stdout):
+#   rows read:        100,000
+#   accepted:          97,843
+#   rejected (BF):      2,157   (2.16% — probably duplicate)
+#   parse errors:           0
+#   wall time:          1.420s
+#   throughput:        70,422 rows/sec
+#   bloom est. FPR:    0.00940
+#   segment size:        2.4 MB
 
-# 2. Sorgu çalıştır
-./uniqcol query --db data/events.uniq \
-  "SELECT user_id, amount WHERE country = 'TR'"
+# 2. Segment meta verisini incele (demo komutu)
+./uniqcol inspect data/events.uniq
 
-# 3. Aggregation
-./uniqcol query --db data/events.uniq \
-  "SELECT COUNT(*), SUM(amount) WHERE country = 'TR'"
+# Beklenen çıktı: format/şema/PK/Bloom parametreleri ve
+# kolon başına payload boyutları (column pruning).
+
+# 3. Bloom filtresiz mod (benchmark/yazma-amaçlı)
+./uniqcol load --no-bloom \
+  --csv testdata/events.csv \
+  --out data/events-nobf.uniq \
+  --pk event_id \
+  --schema event_id:int64,user_id:int64,amount:float64,country:string
+
+# Sorgu motoru (SELECT/WHERE/COUNT/SUM) İterasyon 3 Bölüm B'de eklenecek.
 ```
 
 ### Programatik Kullanım (Go)

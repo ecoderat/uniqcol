@@ -527,6 +527,33 @@ func (s *Segment) ReadColumn(name string) (any, error) {
 	return v, nil
 }
 
+// ColumnInfo describes a single column's on-disk payload, without
+// decoding it.
+type ColumnInfo struct {
+	Name       string
+	Type       ColumnType
+	Encoding   Encoding
+	PayloadLen int
+}
+
+// ColumnInfo returns per-column on-disk metadata in schema order: name,
+// type, encoding, and payload length in bytes. Each call returns a
+// fresh slice — callers may sort or otherwise mutate it without
+// affecting internal state. Payloads are not touched.
+func (s *Segment) ColumnInfo() []ColumnInfo {
+	out := make([]ColumnInfo, 0, len(s.schema.Columns))
+	for _, c := range s.schema.Columns {
+		b := s.blocks[c.Name]
+		out = append(out, ColumnInfo{
+			Name:       c.Name,
+			Type:       c.Type,
+			Encoding:   b.encoding,
+			PayloadLen: b.payloadLen,
+		})
+	}
+	return out
+}
+
 // Close releases the segment's in-memory buffers. After Close the
 // segment must not be used.
 func (s *Segment) Close() error {

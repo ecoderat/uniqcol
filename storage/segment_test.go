@@ -612,3 +612,44 @@ func TestSegmentUnsupportedFutureVersion(t *testing.T) {
 		t.Fatalf("err = %v; want ErrUnsupportedVersion", err)
 	}
 }
+
+func TestSegmentColumnInfo(t *testing.T) {
+	buf, _, _, _, _ := buildFixture(t, 25)
+	var bb bytes.Buffer
+	if err := WriteSegment(&bb, fixtureSchema(), buf, WriteSegmentOpts{}); err != nil {
+		t.Fatalf("WriteSegment: %v", err)
+	}
+	seg, err := parseSegment(bb.Bytes())
+	if err != nil {
+		t.Fatalf("parseSegment: %v", err)
+	}
+	defer seg.Close()
+
+	info := seg.ColumnInfo()
+	want := fixtureSchema().Columns
+	if len(info) != len(want) {
+		t.Fatalf("ColumnInfo len = %d; want %d", len(info), len(want))
+	}
+	for i, ci := range info {
+		if ci.Name != want[i].Name {
+			t.Errorf("col[%d].Name = %q; want %q", i, ci.Name, want[i].Name)
+		}
+		if ci.Type != want[i].Type {
+			t.Errorf("col[%d].Type = %v; want %v", i, ci.Type, want[i].Type)
+		}
+		if ci.Encoding != EncodingRLE {
+			t.Errorf("col[%d].Encoding = %v; want %v (chooseEncoding currently always RLE)",
+				i, ci.Encoding, EncodingRLE)
+		}
+		if ci.PayloadLen == 0 {
+			t.Errorf("col[%d].PayloadLen = 0; want non-zero", i)
+		}
+	}
+
+	// Mutating the returned slice must not affect future calls.
+	info[0].Name = "mutated"
+	info2 := seg.ColumnInfo()
+	if info2[0].Name != want[0].Name {
+		t.Errorf("internal state aliased: second call returned %q after mutation", info2[0].Name)
+	}
+}
