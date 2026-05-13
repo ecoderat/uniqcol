@@ -42,8 +42,8 @@ Proje **iteratif ve inkremental geliştirme modeli** ile yürütülmektedir. Sı
 - [x] CLI: `load <csv>`, `inspect <segment>` (sorgu motoru aşağıda)
 - [ ] `SELECT col1, col2 WHERE col = X` desteği
 - [ ] `COUNT`, `SUM` aggregation
-- [ ] Benchmark suite + sonuç grafikleri
-- [ ] Cyclomatic complexity ve test coverage raporları
+- [x] Benchmark suite (`bench/`) + ham sonuç tabloları
+- [x] Cyclomatic complexity ve test coverage raporları
 
 > **Not:** Dictionary encoding, GROUP BY ve multi-segment merge bilinçli olarak bu prototipin dışında bırakılmıştır. Bkz. [Gelecek Çalışmalar](#gelecek-çalışmalar).
 
@@ -212,45 +212,86 @@ Her segment dosyası şu yapıdadır:
 
 ## Benchmark Sonuçları
 
-> **Durum:** Sonuçlar İterasyon 3 sonunda doldurulacaktır.
+Tekrar üretmek için: `go test -bench=. -benchmem -benchtime=1x ./bench/...`
+(daha fazla ayrıntı: [`bench/README.md`](bench/README.md)).
+
+Çalıştırma ortamı: `darwin/arm64`, Apple M4, Go 1.26. Tek koşumdan
+alınan rakamlardır; üretim performans karşılaştırması değildir.
 
 ### Yazma Throughput'u (Bloom Filter ON vs OFF)
 
-| Satır Sayısı | BF Kapalı | BF Açık | Overhead |
-|---|---|---|---|
-| 10K | TBD | TBD | TBD |
-| 100K | TBD | TBD | TBD |
-| 1M | TBD | TBD | TBD |
+| Satır Sayısı | BF Kapalı (rows/sec) | BF Açık (rows/sec) | BF Kapalı Süre | BF Açık Süre | Overhead |
+|---|---|---|---|---|---|
+| 10K  | 11,097,240 | 3,179,439 | 1.0 ms   | 4.1 ms   | ~3.5× yavaşlama |
+| 100K | 15,123,159 | 4,794,381 | 6.6 ms   | 20.9 ms  | ~3.2× yavaşlama |
+| 1M   | 22,831,745 | 8,109,530 | 43.8 ms  | 123.4 ms | ~2.8× yavaşlama |
 
 ### Okuma (Filtreli Scan)
 
 | Senaryo | Süre | Throughput |
 |---|---|---|
-| `SELECT col WHERE x = K` (1M satır, %1 seçicilik) | TBD | TBD |
-| `COUNT(*) WHERE x = K` (1M satır) | TBD | TBD |
+| `SELECT col WHERE x = K` (1M satır, %1 seçicilik) | TBD (sorgu motoru İterasyon 3-B'de) | TBD |
+| `OpenSegment + ReadColumn("amount")` (1M satır) † | 10.9 ms | 91.6 M rows/sec |
+
+† Filtresiz tam kolon taraması; `COUNT(*) WHERE` için alt sınır
+proxy'sidir (gerçek filtreli sorgu yalnızca kabul edilen satırları
+seçeceği için bunun kadar veya bundan hızlı olmalıdır).
 
 ### Sıkıştırma Oranı (RLE)
 
-| Veri Profili | Ham Boyut | Sıkıştırılmış | Oran |
+| Veri Profili (100K satır) | Ham Boyut | RLE Boyutu | Oran |
 |---|---|---|---|
-| Düşük kardinalite (10 unique) | TBD | TBD | TBD |
-| Yüksek kardinalite (rastgele) | TBD | TBD | TBD |
+| Düşük kardinalite (20 country, round-robin) | 300,000 B | 400,000 B | **0.75** (kötü) |
+| Yüksek kardinalite (rastgele int64)         | 800,000 B | 899,991 B | **0.89** (kötü) |
+| Monotonik artan int64                       | 800,000 B | 900,000 B | **0.89** (kötü) |
+| Kümeli int64 (100 run × 1000 tekrar)        | 800,000 B |   1,000 B | **800×** ✓ |
 
 ### Bloom Filter False Positive Oranı
 
-| Hedef FPR | Ölçülen FPR | Bellek (1M kayıt için) |
-|---|---|---|
-| 1% | TBD | TBD |
-| 0.1% | TBD | TBD |
+100K kayıt için ölçüm + 1M kayıt için sınır hesabı
+(`m = ceil(-n·ln p / (ln 2)²)` doğrusaldır, fark sadece ölçeklemedir).
+
+| Hedef FPR | Ölçülen FPR (100K kayıt) | Bellek (100K kayıt) | Bellek (1M kayıt) |
+|---|---|---|---|
+| 1% (0.01)    | 1.242%   | 117 KB | ~1.14 MB |
+| 0.1% (0.001) | 0.1014%  | 175 KB | ~1.71 MB |
 
 ### Yazılım Mühendisliği Metrikleri
 
 | Metrik | Değer | Araç |
 |---|---|---|
-| Toplam LOC | TBD | `cloc` |
-| Cyclomatic complexity (max) | TBD | `gocyclo` |
-| Test coverage | TBD | `go test -cover` |
-| Paket sayısı | 5 | — |
+| Toplam LOC (test hariç) | 2,193 | `wc -l` |
+| Test LOC                | 3,101 | `wc -l` |
+| Cyclomatic complexity (max) | 28 (`storage.WriteSegment`, `storage.parseSegment`, `runLoad`) | `gocyclo` |
+| Test coverage           | storage 90.3% / bloom 94.9% / cmd 90.8% / bench/datagen 100% | `go test -cover` |
+| Paket sayısı            | 5 (`storage`, `bloom`, `cmd/uniqcol`, `bench`, kök) | — |
+
+### Benchmark Sonuçları Üzerine Notlar
+
+- **BF maliyeti ~3× yazma yavaşlaması.** Tek bir `Insert` hashing
+  (FNV-1a 128, double hashing ile k=7 dizin türetme), k bitlik kontrol
+  ve k bitlik kayıt anlamına geliyor. Allokasyon profili (BF açık: 1M
+  alloc; BF kapalı: 175 alloc) maliyetin büyük kısmının PK byte
+  dilimi başına `make([]byte, 8)` çağrısı olduğunu gösteriyor; bunlar
+  bir sonraki iterasyonda `[]byte` stack tahsisleriyle veya kalıcı
+  bir arabellekle düşürülebilir.
+- **RLE rastgele/monoton int64'te kaybediyor.** Her satır kendi
+  başına bir run (count=1) olarak kodlanıyor, bu da değer başına 1
+  baytlık uvarint overhead'ı demek (8 → 9). 800.000 baytlık ham veri
+  900.000 bayta çıkıyor. RLE yalnızca **ardışık tekrarları**
+  sıkıştırır; sıralı olmak yetmez. README'nin "Gelecek Çalışmalar"
+  bölümünde belirtilen dictionary encoding bu sınırlamayı çözmek
+  için tasarlanmıştır. Kümeli profilde (1000 tekrarlı 100 değer) RLE
+  beklendiği gibi davranıp 800× sıkıştırma sağlıyor.
+- **Ölçülen FPR hedef değere oldukça yakın.** %1 hedefte ölçülen
+  %1.24, %0.1 hedefte ölçülen %0.101 — Kirsch & Mitzenmacher double
+  hashing yaklaşımının uniqcol'un kapasitesinde sapmadığını
+  gösteriyor. Beklenen istatistiksel salınım çerçevesindedir.
+- **Kolon okuma çok hızlı, çünkü mmap yok.** 91.6 M rows/sec rakamı
+  segmentin `os.ReadFile` ile RAM'e tamamen yüklenmesinden sonra
+  ölçülmektedir. Gerçek disk ilk-okuması çok daha yavaş olacaktır;
+  bu özellikle mmap geçişi için bir TODO olarak `segment.go`'da
+  belirtilmiştir.
 
 ---
 
