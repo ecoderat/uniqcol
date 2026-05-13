@@ -306,3 +306,140 @@ func TestTableBloomAndStatsAccessors(t *testing.T) {
 		t.Errorf("Stats() = %+v; want {1,1,1}", s)
 	}
 }
+
+func TestCreateTable_BloomDisabled(t *testing.T) {
+	// Pass deliberately nonsense Bloom params to prove they're not consulted
+	// when BloomDisabled is set.
+	tb, err := CreateTable(tableTestSchema(), TableOptions{
+		BloomExpectedItems: 0,
+		BloomTargetFPR:     1.0,
+		BloomDisabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateTable with BloomDisabled: %v", err)
+	}
+	if tb.Bloom() != nil {
+		t.Fatalf("Bloom() = %v; want nil when BloomDisabled", tb.Bloom())
+	}
+	if tb.Schema().PK != "id" {
+		t.Errorf("Schema().PK = %q; want \"id\"", tb.Schema().PK)
+	}
+}
+
+func TestInsert_BloomDisabled_AcceptsDuplicates(t *testing.T) {
+	tb, err := CreateTable(tableTestSchema(), TableOptions{BloomDisabled: true})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	row := Row{int64(42), 9.99, "TR"}
+	for i := range 3 {
+		r := tb.Insert(row)
+		if !r.Accepted {
+			t.Fatalf("insert #%d rejected: %s", i, r.Reason)
+		}
+	}
+	s := tb.Stats()
+	if s.Accepted != 3 || s.Rejected != 0 || s.BufferLen != 3 {
+		t.Errorf("Stats() = %+v; want {Accepted:3, Rejected:0, BufferLen:3}", s)
+	}
+}
+
+func TestInsert_BloomDisabled_StillTypeChecks(t *testing.T) {
+	tb, _ := CreateTable(tableTestSchema(), TableOptions{BloomDisabled: true})
+
+	cases := []struct {
+		name    string
+		row     Row
+		wantSub string
+	}{
+		{"wrong column count", Row{int64(1), 1.0}, "row has 2 values"},
+		{"string in int64 PK slot", Row{"nope", 1.0, "TR"}, "type error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := tb.Insert(tc.row)
+			if r.Accepted {
+				t.Fatalf("BF-off mode accepted malformed row; expected rejection with %q", tc.wantSub)
+			}
+			if !strings.Contains(r.Reason, tc.wantSub) {
+				t.Fatalf("Reason = %q; want substring %q", r.Reason, tc.wantSub)
+			}
+		})
+	}
+	// Rejected counter advanced once per bad row; no rows in buffer.
+	if got := tb.Stats().BufferLen; got != 0 {
+		t.Errorf("BufferLen after only-bad inserts = %d; want 0", got)
+	}
+	if got := tb.Stats().Rejected; got != uint64(len(cases)) {
+		t.Errorf("Rejected = %d; want %d", got, len(cases))
+	}
+}
+
+func TestFlush_BloomDisabled_NoTrailer(t *testing.T) {
+	tb, _ := CreateTable(tableTestSchema(), TableOptions{BloomDisabled: true})
+	rows := []Row{
+		{int64(1), 1.0, "TR"},
+		{int64(2), 2.0, "US"},
+		{int64(3), 3.0, "DE"},
+	}
+	for _, r := range rows {
+		if got := tb.Insert(r); !got.Accepted {
+			t.Fatalf("setup: insert rejected: %s", got.Reason)
+		}
+	}
+
+	var bb bytes.Buffer
+	if err := tb.Flush(&bb); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	seg, err := parseSegment(bb.Bytes())
+	if err != nil {
+		t.Fatalf("parseSegment: %v", err)
+	}
+	defer seg.Close()
+
+	if got := seg.RowCount(); got != uint64(len(rows)) {
+		t.Errorf("RowCount() = %d; want %d", got, len(rows))
+	}
+	if got := seg.Schema(); len(got.Columns) != 3 {
+		t.Errorf("Schema().Columns = %d; want 3", len(got.Columns))
+	}
+	if seg.Bloom() != nil {
+		t.Errorf("Bloom() = %v; want nil for BF-off segment", seg.Bloom())
+	}
+	// PK persistence is independent of the Bloom trailer: WriteSegmentOpts
+	// has separate PKName / Bloom fields, and Table.Flush always passes
+	// the schema's PK. So a BF-off segment still carries PK in the flags
+	// block.
+	if got := seg.PKName(); got != "id" {
+		t.Errorf("PKName() = %q; want \"id\" (PK should persist independently of BF)", got)
+	}
+	if got := seg.Schema().PK; got != "id" {
+		t.Errorf("Schema().PK = %q; want \"id\"", got)
+	}
+}
+
+func TestLoadTable_BloomDisabled_Refused(t *testing.T) {
+	tb, _ := CreateTable(tableTestSchema(), TableOptions{BloomDisabled: true})
+	if got := tb.Insert(Row{int64(1), 1.0, "TR"}); !got.Accepted {
+		t.Fatalf("setup: insert rejected: %s", got.Reason)
+	}
+
+	path := filepath.Join(t.TempDir(), "bf-off.uniq")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := tb.Flush(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, err = LoadTable(path)
+	if !errors.Is(err, ErrIncompatibleSegment) {
+		t.Fatalf("LoadTable on BF-off segment err = %v; want ErrIncompatibleSegment", err)
+	}
+}

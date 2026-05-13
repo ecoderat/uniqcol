@@ -20,10 +20,21 @@ type TableOptions struct {
 	// BloomExpectedItems sizes the Bloom filter for the anticipated row
 	// count. Once exceeded, the filter's false-positive rate grows beyond
 	// the target and rebuilding is recommended (see EstimatedFPR).
+	// Ignored when BloomDisabled is true.
 	BloomExpectedItems uint64
 	// BloomTargetFPR is the desired false-positive rate at saturation,
-	// in (0, 1). Typical values: 0.01 (1%) or 0.001 (0.1%).
+	// in (0, 1). Typical values: 0.01 (1%) or 0.001 (0.1%). Ignored when
+	// BloomDisabled is true.
 	BloomTargetFPR float64
+	// BloomDisabled turns off write-time dedup entirely. The Table is
+	// constructed without a filter, Insert always accepts (subject to
+	// type validation), and Flush writes a segment with no Bloom trailer.
+	//
+	// This is a write-only / benchmark-only mode: LoadTable refuses
+	// segments without a Bloom trailer, because uniqueness cannot be
+	// enforced on reload. Use it for measuring the cost of the filter,
+	// not for production ingest.
+	BloomDisabled bool
 }
 
 // InsertResult is the outcome of a single Table.Insert call.
@@ -63,16 +74,20 @@ type Table struct {
 	rejected uint64
 }
 
-// CreateTable builds a fresh Table around schema and a newly constructed
-// Bloom filter. Returns an error if the schema fails Validate or the
-// Bloom parameters are out of range.
+// CreateTable builds a fresh Table around schema and (unless
+// BloomDisabled) a newly constructed Bloom filter. Returns an error if
+// the schema fails Validate or the Bloom parameters are out of range.
 func CreateTable(schema Schema, opts TableOptions) (*Table, error) {
 	if err := schema.Validate(); err != nil {
 		return nil, fmt.Errorf("table: schema: %w", err)
 	}
-	bf, err := bloom.New(opts.BloomExpectedItems, opts.BloomTargetFPR)
-	if err != nil {
-		return nil, fmt.Errorf("table: bloom: %w", err)
+	var bf *bloom.Filter
+	if !opts.BloomDisabled {
+		var err error
+		bf, err = bloom.New(opts.BloomExpectedItems, opts.BloomTargetFPR)
+		if err != nil {
+			return nil, fmt.Errorf("table: bloom: %w", err)
+		}
 	}
 	pkIdx := schema.PKIndex()
 	return &Table{
@@ -119,9 +134,9 @@ func LoadTable(path string) (*Table, error) {
 	}, nil
 }
 
-// Insert validates row, checks the Bloom filter on the PK column, and
-// either appends the row to the buffer (accepted) or returns the
-// reason for rejection. The buffer is left unchanged on rejection.
+// Insert validates row and, unless the Bloom filter is disabled, checks
+// it on the PK column. On accept the row is appended to the buffer; on
+// reject the buffer is left unchanged and the reason is returned.
 func (t *Table) Insert(row Row) InsertResult {
 	if len(row) != len(t.schema.Columns) {
 		t.rejected++
@@ -130,23 +145,32 @@ func (t *Table) Insert(row Row) InsertResult {
 				len(row), len(t.schema.Columns)),
 		}
 	}
-	pkBytes, err := pkBytes(row[t.pkIdx], t.pkType)
-	if err != nil {
-		t.rejected++
-		return InsertResult{
-			Reason: fmt.Sprintf("type error: PK column %q: %v",
-				t.schema.Columns[t.pkIdx].Name, err),
+	if t.bloom != nil {
+		pkBytes, err := pkBytes(row[t.pkIdx], t.pkType)
+		if err != nil {
+			t.rejected++
+			return InsertResult{
+				Reason: fmt.Sprintf("type error: PK column %q: %v",
+					t.schema.Columns[t.pkIdx].Name, err),
+			}
 		}
+		if t.bloom.Contains(pkBytes) {
+			t.rejected++
+			return InsertResult{Reason: "duplicate (bloom positive)"}
+		}
+		if err := t.buf.Append(row); err != nil {
+			t.rejected++
+			return InsertResult{Reason: fmt.Sprintf("type error: %v", err)}
+		}
+		t.bloom.Add(pkBytes)
+		t.accepted++
+		return InsertResult{Accepted: true}
 	}
-	if t.bloom.Contains(pkBytes) {
-		t.rejected++
-		return InsertResult{Reason: "duplicate (bloom positive)"}
-	}
+	// BloomDisabled path: validate types via buffer Append; no dedup.
 	if err := t.buf.Append(row); err != nil {
 		t.rejected++
 		return InsertResult{Reason: fmt.Sprintf("type error: %v", err)}
 	}
-	t.bloom.Add(pkBytes)
 	t.accepted++
 	return InsertResult{Accepted: true}
 }
