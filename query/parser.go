@@ -31,6 +31,24 @@ const (
 	ProjCountStar
 	// ProjSumColumn is SUM(col); SumColumn is populated.
 	ProjSumColumn
+	// ProjGrouped is "<group-col>, <aggregate>" paired with a GROUP BY
+	// clause. Columns holds the literal SELECT projection ([groupCol])
+	// for diagnostics; GroupAgg selects which aggregate follows; and
+	// the *authoritative* group column is Query.GroupBy — see that
+	// field's doc comment.
+	ProjGrouped
+)
+
+// AggregateKind selects which aggregate follows the group column when
+// Projection == ProjGrouped.
+type AggregateKind int
+
+// Aggregate kinds.
+const (
+	// AggCountStar is COUNT(*) — counts rows per group.
+	AggCountStar AggregateKind = iota
+	// AggSumColumn is SUM(col); SumColumn names the source column.
+	AggSumColumn
 )
 
 // FilterOp is the comparison operator in a WHERE clause.
@@ -101,9 +119,24 @@ type FilterExpr struct {
 // Query is a parsed SELECT statement.
 type Query struct {
 	Projection ProjectionKind
-	Columns    []string    // populated for ProjColumns
-	SumColumn  string      // populated for ProjSumColumn
-	Where      *FilterExpr // nil if no WHERE
+	// Columns is populated for ProjColumns (the column list) and for
+	// ProjGrouped (a one-element slice mirroring the SELECT projection
+	// for diagnostics). In ProjGrouped mode the executor does NOT read
+	// the group column from here — see GroupBy.
+	Columns []string
+	// SumColumn names the source column for ProjSumColumn and for
+	// ProjGrouped + AggSumColumn.
+	SumColumn string
+	// GroupBy is the SINGLE SOURCE OF TRUTH for the grouping column.
+	// Empty when there is no GROUP BY clause. The parser validates that
+	// it matches the projected group column, then the executor reads
+	// GroupBy (not Columns[0]) for grouping work.
+	GroupBy string
+	// GroupAgg selects which aggregate follows the group column.
+	// Meaningful only when Projection == ProjGrouped.
+	GroupAgg AggregateKind
+	// Where is the parsed WHERE expression tree, or nil.
+	Where *FilterExpr
 }
 
 // Parse tokenizes and parses input into a Query. Errors include the
@@ -156,6 +189,9 @@ var keywords = map[string]struct{}{
 	"SUM":    {},
 	"AND":    {},
 	"OR":     {},
+	"GROUP":  {},
+	"BY":     {},
+	"HAVING": {}, // recognized only so we can reject it with a helpful error
 	"FROM":   {}, // recognized only so we can reject it with a helpful error
 }
 
@@ -298,7 +334,96 @@ func (p *parser) parseQuery() (*Query, error) {
 		}
 		q.Where = expr
 	}
+	// Optional GROUP BY.
+	t = p.peek()
+	if t.kind == tkKeyword && t.text == "GROUP" {
+		if err := p.parseGroupBy(q); err != nil {
+			return nil, err
+		}
+	}
+	// Explicit HAVING rejection (lives wherever the user wrote it).
+	if hav := p.peek(); hav.kind == tkKeyword && hav.text == "HAVING" {
+		return nil, fmt.Errorf("parse error at position %d: HAVING is not supported", hav.pos)
+	}
+	if err := validateGrouped(q); err != nil {
+		return nil, err
+	}
 	return q, nil
+}
+
+// parseGroupedAggregate consumes the aggregate that follows the group
+// column in a "<col>, AGG(...)" projection. The caller has already
+// consumed the comma and validated that Columns currently contains
+// exactly the one group column.
+func (p *parser) parseGroupedAggregate(q *Query) error {
+	agg := p.advance() // COUNT or SUM
+	if err := p.expectKind(tkLParen, "'('"); err != nil {
+		return err
+	}
+	switch agg.text {
+	case "COUNT":
+		next := p.advance()
+		if next.kind != tkStar {
+			return fmt.Errorf("parse error at position %d: expected '*' in COUNT(*), got %q", next.pos, displayToken(next))
+		}
+		q.GroupAgg = AggCountStar
+	case "SUM":
+		next := p.advance()
+		if next.kind != tkIdent {
+			return fmt.Errorf("parse error at position %d: expected column name inside SUM(...), got %q", next.pos, displayToken(next))
+		}
+		q.GroupAgg = AggSumColumn
+		q.SumColumn = next.text
+	}
+	if err := p.expectKind(tkRParen, "')'"); err != nil {
+		return err
+	}
+	q.Projection = ProjGrouped
+	return nil
+}
+
+// parseGroupBy consumes "GROUP BY <ident>". Multi-column GROUP BY is
+// explicitly rejected with a specific message.
+func (p *parser) parseGroupBy(q *Query) error {
+	groupTok := p.advance() // GROUP
+	by := p.advance()
+	if by.kind != tkKeyword || by.text != "BY" {
+		return fmt.Errorf("parse error at position %d: expected BY after GROUP, got %q", by.pos, displayToken(by))
+	}
+	_ = groupTok
+	col := p.advance()
+	if col.kind != tkIdent {
+		return fmt.Errorf("parse error at position %d: expected column name after GROUP BY, got %q", col.pos, displayToken(col))
+	}
+	q.GroupBy = col.text
+	// Multi-column GROUP BY: explicit rejection.
+	if next := p.peek(); next.kind == tkComma {
+		return fmt.Errorf("parse error at position %d: only single-column GROUP BY is supported", next.pos)
+	}
+	return nil
+}
+
+// validateGrouped enforces the cross-clause invariants between the
+// SELECT projection and any GROUP BY clause. See the four-rule table in
+// the query-package design notes.
+func validateGrouped(q *Query) error {
+	if q.Projection == ProjGrouped && q.GroupBy == "" {
+		// User wrote "SELECT col, COUNT(*)" without GROUP BY.
+		return fmt.Errorf("parse error: aggregate-with-column projection requires a GROUP BY clause")
+	}
+	if q.Projection == ProjGrouped && q.GroupBy != q.Columns[0] {
+		return fmt.Errorf("parse error: GROUP BY column %q does not match projected column %q",
+			q.GroupBy, q.Columns[0])
+	}
+	if q.GroupBy != "" && q.Projection == ProjColumns {
+		// Plain column projection with GROUP BY → no aggregate.
+		return fmt.Errorf("parse error: GROUP BY requires exactly one aggregate in the projection")
+	}
+	if q.GroupBy != "" && (q.Projection == ProjCountStar || q.Projection == ProjSumColumn || q.Projection == ProjStar) {
+		// Aggregate-only projection or SELECT * with GROUP BY → no group column projected.
+		return fmt.Errorf("parse error: GROUP BY column must appear in the projection")
+	}
+	return nil
 }
 
 // parseWhere parses one or more comparisons joined by AND / OR and
@@ -420,20 +545,34 @@ func (p *parser) parseProjection(q *Query) error {
 		}
 		return nil
 	case t.kind == tkIdent:
-		// Column list.
+		// Column list — or, if the second item is COUNT(*)/SUM(col),
+		// a grouped projection.
 		first := p.advance()
 		q.Projection = ProjColumns
 		q.Columns = []string{first.text}
 		for p.peek().kind == tkComma {
 			p.advance()
-			n := p.advance()
+			n := p.peek()
+			// Grouped projection: <col>, COUNT(*) | SUM(col)
+			if n.kind == tkKeyword && (n.text == "COUNT" || n.text == "SUM") {
+				if len(q.Columns) != 1 {
+					return fmt.Errorf("parse error at position %d: GROUP BY projection must be exactly: group column, then one aggregate",
+						n.pos)
+				}
+				if err := p.parseGroupedAggregate(q); err != nil {
+					return err
+				}
+				// Extra column or aggregate after the first aggregate.
+				if nxt := p.peek(); nxt.kind == tkComma {
+					return fmt.Errorf("parse error at position %d: GROUP BY projection must be exactly: group column, then one aggregate",
+						nxt.pos)
+				}
+				return nil
+			}
+			n = p.advance()
 			if n.kind != tkIdent {
-				// Helpful messages for common slips.
 				if n.kind == tkStar {
 					return fmt.Errorf("parse error at position %d: expected column name, got '*' (cannot mix column projection with '*')", n.pos)
-				}
-				if n.kind == tkKeyword && (n.text == "COUNT" || n.text == "SUM") {
-					return fmt.Errorf("parse error at position %d: cannot mix column projection with aggregation", n.pos)
 				}
 				return fmt.Errorf("parse error at position %d: expected column name, got %q", n.pos, displayToken(n))
 			}

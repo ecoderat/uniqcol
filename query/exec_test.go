@@ -455,3 +455,228 @@ func TestExecute_MalformedFilterExpr(t *testing.T) {
 		t.Fatalf("err = %v; want a malformed-FilterExpr error", err)
 	}
 }
+
+// groupBy collects (group → aggregate) pairs from a grouped Result for
+// order-independent assertions. The order-preserving check has its own
+// test below.
+func groupsMap(r *Result) map[any]any {
+	m := make(map[any]any, len(r.Rows))
+	for _, row := range r.Rows {
+		m[row[0]] = row[1]
+	}
+	return m
+}
+
+func TestExecute_GroupByCount(t *testing.T) {
+	seg := buildTestSegment(t)
+	// Fixture countries: TR×3, US×1, DE×1
+	r, err := Execute(seg, mustParse(t, "SELECT country, COUNT(*) GROUP BY country"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := []string{r.Columns[0], r.Columns[1]}; got[0] != "country" || got[1] != "COUNT(*)" {
+		t.Errorf("Columns = %v; want [country COUNT(*)]", got)
+	}
+	want := map[any]any{
+		"TR": uint64(3),
+		"US": uint64(1),
+		"DE": uint64(1),
+	}
+	got := groupsMap(r)
+	if len(got) != len(want) {
+		t.Fatalf("got %d groups (%v); want %d", len(got), got, len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("group %v: got %v; want %v", k, got[k], v)
+		}
+	}
+}
+
+func TestExecute_GroupBySum(t *testing.T) {
+	seg := buildTestSegment(t)
+	// amounts by country: TR=10+30+50=90, US=20, DE=40
+	r, err := Execute(seg, mustParse(t, "SELECT country, SUM(amount) GROUP BY country"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if r.Columns[1] != "SUM(amount)" {
+		t.Errorf("agg header = %q; want SUM(amount)", r.Columns[1])
+	}
+	want := map[any]any{"TR": 90.0, "US": 20.0, "DE": 40.0}
+	got := groupsMap(r)
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("group %v: got %v; want %v", k, got[k], v)
+		}
+	}
+}
+
+func TestExecute_GroupByWithWhere_FilterRunsFirst(t *testing.T) {
+	seg := buildTestSegment(t)
+	// All rows: TR×3 (10,30,50), US×1 (20), DE×1 (40).
+	// WHERE amount > 25 keeps: TR×2 (30,50), DE×1 (40). US drops entirely.
+	// Grouped result MUST reflect post-filter counts.
+	r, err := Execute(seg, mustParse(t,
+		"SELECT country, COUNT(*) WHERE amount > 25.0 GROUP BY country"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := groupsMap(r)
+	if got["TR"] != uint64(2) {
+		t.Errorf("TR count = %v; want 2 (only 30 and 50 pass the filter)", got["TR"])
+	}
+	if got["DE"] != uint64(1) {
+		t.Errorf("DE count = %v; want 1", got["DE"])
+	}
+	if _, present := got["US"]; present {
+		t.Errorf("US should be absent (20 fails filter), got %v", got["US"])
+	}
+}
+
+func TestExecute_GroupByInt64Key(t *testing.T) {
+	seg := buildTestSegment(t)
+	// Fixture ids are all unique (1..5) so every group has count 1.
+	r, err := Execute(seg, mustParse(t, "SELECT id, COUNT(*) GROUP BY id"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(r.Rows) != 5 {
+		t.Fatalf("got %d groups; want 5", len(r.Rows))
+	}
+	for _, row := range r.Rows {
+		if _, ok := row[0].(int64); !ok {
+			t.Errorf("group key type = %T; want int64", row[0])
+		}
+		if row[1].(uint64) != 1 {
+			t.Errorf("count = %v; want 1", row[1])
+		}
+	}
+}
+
+func TestExecute_GroupByFloat64Key(t *testing.T) {
+	seg := buildTestSegment(t)
+	// All amounts are distinct floats, so 5 groups.
+	r, err := Execute(seg, mustParse(t, "SELECT amount, COUNT(*) GROUP BY amount"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(r.Rows) != 5 {
+		t.Fatalf("got %d groups; want 5", len(r.Rows))
+	}
+	if _, ok := r.Rows[0][0].(float64); !ok {
+		t.Errorf("group key type = %T; want float64", r.Rows[0][0])
+	}
+}
+
+func TestExecute_GroupBy_DiscoveryOrderDeterministic(t *testing.T) {
+	seg := buildTestSegment(t)
+	q := mustParse(t, "SELECT country, COUNT(*) GROUP BY country")
+	r1, err := Execute(seg, q)
+	if err != nil {
+		t.Fatalf("Execute 1: %v", err)
+	}
+	r2, err := Execute(seg, q)
+	if err != nil {
+		t.Fatalf("Execute 2: %v", err)
+	}
+	if len(r1.Rows) != len(r2.Rows) {
+		t.Fatalf("row counts differ: %d vs %d", len(r1.Rows), len(r2.Rows))
+	}
+	for i := range r1.Rows {
+		if r1.Rows[i][0] != r2.Rows[i][0] {
+			t.Fatalf("discovery order differs at row %d: %v vs %v", i, r1.Rows[i][0], r2.Rows[i][0])
+		}
+	}
+	// Discovery order matches the row order in the fixture: TR, US, TR, DE, TR → TR, US, DE
+	wantOrder := []any{"TR", "US", "DE"}
+	for i, want := range wantOrder {
+		if r1.Rows[i][0] != want {
+			t.Errorf("row %d key = %v; want %v (discovery order)", i, r1.Rows[i][0], want)
+		}
+	}
+}
+
+func TestExecute_GroupBy_PerGroupSumOverflow(t *testing.T) {
+	// Two rows in the same group whose int64 values overflow when summed.
+	schema := storage.Schema{
+		PK: "id",
+		Columns: []storage.Column{
+			{Name: "id", Type: storage.Int64},
+			{Name: "big", Type: storage.Int64},
+			{Name: "g", Type: storage.String},
+		},
+	}
+	tbl, _ := storage.CreateTable(schema, storage.TableOptions{
+		BloomExpectedItems: 10, BloomTargetFPR: 0.01,
+	})
+	if got := tbl.Insert(storage.Row{int64(1), int64(math.MaxInt64 - 1), "G1"}); !got.Accepted {
+		t.Fatalf("setup: %s", got.Reason)
+	}
+	if got := tbl.Insert(storage.Row{int64(2), int64(math.MaxInt64 - 1), "G1"}); !got.Accepted {
+		t.Fatalf("setup: %s", got.Reason)
+	}
+	if got := tbl.Insert(storage.Row{int64(3), int64(5), "G2"}); !got.Accepted {
+		t.Fatalf("setup: %s", got.Reason)
+	}
+	path := filepath.Join(t.TempDir(), "ov.uniq")
+	f, _ := os.Create(path)
+	if err := tbl.Flush(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("flush: %v", err)
+	}
+	_ = f.Close()
+	seg, err := storage.OpenSegment(path)
+	if err != nil {
+		t.Fatalf("OpenSegment: %v", err)
+	}
+	defer seg.Close()
+
+	_, err = Execute(seg, mustParse(t, "SELECT g, SUM(big) GROUP BY g"))
+	if !errors.Is(err, ErrSumOverflow) {
+		t.Fatalf("err = %v; want ErrSumOverflow", err)
+	}
+	if !strings.Contains(err.Error(), "in group") {
+		t.Errorf("err should name the offending group: %v", err)
+	}
+}
+
+func TestExecute_GroupBy_UnknownGroupColumn(t *testing.T) {
+	seg := buildTestSegment(t)
+	// The parser doesn't know columns, so it accepts this. Executor
+	// catches both the projection ref and the GROUP BY ref.
+	_, err := Execute(seg, mustParse(t, "SELECT nope, COUNT(*) GROUP BY nope"))
+	if !errors.Is(err, ErrUnknownColumn) {
+		t.Fatalf("err = %v; want ErrUnknownColumn", err)
+	}
+}
+
+func TestExecute_GroupBy_UnknownSumColumn(t *testing.T) {
+	seg := buildTestSegment(t)
+	_, err := Execute(seg, mustParse(t, "SELECT country, SUM(nope) GROUP BY country"))
+	if !errors.Is(err, ErrUnknownColumn) {
+		t.Fatalf("err = %v; want ErrUnknownColumn", err)
+	}
+}
+
+func TestExecute_GroupBy_SumOnString(t *testing.T) {
+	seg := buildTestSegment(t)
+	_, err := Execute(seg, mustParse(t, "SELECT id, SUM(country) GROUP BY id"))
+	if !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("err = %v; want ErrTypeMismatch", err)
+	}
+}
+
+func TestExecute_GroupBy_NotAggregateResult(t *testing.T) {
+	seg := buildTestSegment(t)
+	r, err := Execute(seg, mustParse(t, "SELECT country, COUNT(*) GROUP BY country"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Grouped output is a row set (one row per group), not a single
+	// aggregate cell — so IsAggregate must be false so the CLI doesn't
+	// suppress the "(showing N of M)" footer in --limit cases.
+	if r.IsAggregate() {
+		t.Errorf("grouped Result should NOT report IsAggregate()=true")
+	}
+}

@@ -136,7 +136,7 @@ func TestParse_ErrorMessages(t *testing.T) {
 		{"not SELECT", "INSERT id", "expected SELECT"},
 		{"FROM rejected", "SELECT id FROM events", "unexpected FROM clause"},
 		{"projection after comma is star", "SELECT a, *", "cannot mix"},
-		{"projection has SUM after comma", "SELECT a, SUM(b)", "aggregation"},
+		{"grouped projection without GROUP BY", "SELECT a, SUM(b)", "requires a GROUP BY clause"},
 		{"empty input", "", "expected SELECT"},
 		{"select then nothing", "SELECT", "expected column name"},
 		{"missing rparen on count", "SELECT COUNT(*", "expected ')'"},
@@ -348,5 +348,157 @@ func TestParse_FilterPosAnchored(t *testing.T) {
 	// "country" starts at byte offset 15 in "SELECT * WHERE country..."
 	if q.Where.Comparison.Pos != 15 {
 		t.Errorf("Comparison.Pos = %d; want 15", q.Where.Comparison.Pos)
+	}
+}
+
+func TestParse_GroupBy_Valid(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantGroup string
+		wantAgg   AggregateKind
+		wantSum   string
+		wantWhere bool
+	}{
+		{
+			name:      "grouped COUNT(*)",
+			input:     "SELECT country, COUNT(*) GROUP BY country",
+			wantGroup: "country",
+			wantAgg:   AggCountStar,
+		},
+		{
+			name:      "grouped SUM(col)",
+			input:     "SELECT country, SUM(amount) GROUP BY country",
+			wantGroup: "country",
+			wantAgg:   AggSumColumn,
+			wantSum:   "amount",
+		},
+		{
+			name:      "grouped with WHERE before GROUP BY",
+			input:     "SELECT country, COUNT(*) WHERE amount > 10.0 GROUP BY country",
+			wantGroup: "country",
+			wantAgg:   AggCountStar,
+			wantWhere: true,
+		},
+		{
+			name:      "case-insensitive group by",
+			input:     "select country, count(*) group by country",
+			wantGroup: "country",
+			wantAgg:   AggCountStar,
+		},
+		{
+			name:      "mixed-case Group By",
+			input:     "SELECT country, COUNT(*) Group By country",
+			wantGroup: "country",
+			wantAgg:   AggCountStar,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.input)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if q.Projection != ProjGrouped {
+				t.Errorf("Projection = %v; want ProjGrouped", q.Projection)
+			}
+			if q.GroupBy != tc.wantGroup {
+				t.Errorf("GroupBy = %q; want %q", q.GroupBy, tc.wantGroup)
+			}
+			if q.GroupAgg != tc.wantAgg {
+				t.Errorf("GroupAgg = %v; want %v", q.GroupAgg, tc.wantAgg)
+			}
+			if q.SumColumn != tc.wantSum {
+				t.Errorf("SumColumn = %q; want %q", q.SumColumn, tc.wantSum)
+			}
+			if (q.Where != nil) != tc.wantWhere {
+				t.Errorf("Where presence = %v; want %v", q.Where != nil, tc.wantWhere)
+			}
+			// Columns must still hold the literal SELECT projection for
+			// diagnostics, but the executor reads GroupBy.
+			if len(q.Columns) != 1 || q.Columns[0] != tc.wantGroup {
+				t.Errorf("Columns = %v; want %q in slot 0", q.Columns, tc.wantGroup)
+			}
+		})
+	}
+}
+
+func TestParse_GroupBy_MalformedCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantSub string
+	}{
+		{
+			"no aggregate",
+			"SELECT country GROUP BY country",
+			"GROUP BY requires exactly one aggregate in the projection",
+		},
+		{
+			"no group column in projection",
+			"SELECT COUNT(*) GROUP BY country",
+			"GROUP BY column must appear in the projection",
+		},
+		{
+			"SELECT * with GROUP BY",
+			"SELECT * GROUP BY country",
+			"GROUP BY column must appear in the projection",
+		},
+		{
+			"SELECT SUM(col) with GROUP BY",
+			"SELECT SUM(amount) GROUP BY country",
+			"GROUP BY column must appear in the projection",
+		},
+		{
+			"extra column before aggregate",
+			"SELECT country, user_id, COUNT(*) GROUP BY country",
+			"GROUP BY projection must be exactly: group column, then one aggregate",
+		},
+		{
+			"two aggregates",
+			"SELECT country, COUNT(*), SUM(amount) GROUP BY country",
+			"GROUP BY projection must be exactly: group column, then one aggregate",
+		},
+		{
+			"GROUP BY column mismatches projection",
+			"SELECT country, COUNT(*) GROUP BY user_id",
+			`GROUP BY column "user_id" does not match projected column "country"`,
+		},
+		{
+			"multi-column GROUP BY rejected",
+			"SELECT country, COUNT(*) GROUP BY country, user_id",
+			"only single-column GROUP BY is supported",
+		},
+		{
+			"HAVING rejected",
+			"SELECT country, COUNT(*) GROUP BY country HAVING COUNT(*) > 1",
+			"HAVING is not supported",
+		},
+		{
+			"GROUP missing BY",
+			"SELECT country, COUNT(*) GROUP country",
+			"expected BY after GROUP",
+		},
+		{
+			"GROUP BY missing column",
+			"SELECT country, COUNT(*) GROUP BY",
+			"expected column name after GROUP BY",
+		},
+		{
+			"grouped projection without GROUP BY",
+			"SELECT country, COUNT(*)",
+			"requires a GROUP BY clause",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.input)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error = %q; want substring %q", err.Error(), tc.wantSub)
+			}
+		})
 	}
 }

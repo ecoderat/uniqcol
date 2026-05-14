@@ -94,6 +94,8 @@ func Execute(seg *storage.Segment, q *Query) (*Result, error) {
 		return execSum(seg, q.SumColumn, schema, selection, filtered)
 	case ProjColumns, ProjStar:
 		return execProject(seg, projCols, selection, filtered)
+	case ProjGrouped:
+		return execGrouped(seg, schema, q, selection, filtered)
 	default:
 		return nil, fmt.Errorf("query: unknown projection kind %d", q.Projection)
 	}
@@ -323,10 +325,8 @@ func execSum(seg *storage.Segment, col string, schema storage.Schema, selection 
 			if filtered && !selection[i] {
 				continue
 			}
-			newSum := sum + x
-			// Overflow detection: if sum and x share a sign but newSum has
-			// the opposite sign, we wrapped.
-			if (sum > 0 && x > 0 && newSum < 0) || (sum < 0 && x < 0 && newSum >= 0) {
+			newSum, ok := addInt64Checked(sum, x)
+			if !ok {
 				return nil, fmt.Errorf("%w: column %q exceeds int64 range; consider casting to float64 in source",
 					ErrSumOverflow, col)
 			}
@@ -411,4 +411,142 @@ func estimateRows(total int, selection []bool, filtered bool) int {
 		}
 	}
 	return n
+}
+
+// addInt64Checked returns sum+x and a "no overflow" flag. Overflow
+// occurs when sum and x share a sign but the result has the opposite
+// sign — the standard two's-complement test.
+func addInt64Checked(sum, x int64) (int64, bool) {
+	newSum := sum + x
+	if (sum > 0 && x > 0 && newSum < 0) || (sum < 0 && x < 0 && newSum >= 0) {
+		return 0, false
+	}
+	return newSum, true
+}
+
+// groupAccumulator holds the running aggregate state for one group key.
+// The executor knows globally which aggregate is active for a given
+// query, so the struct doesn't carry its own discriminator — only the
+// relevant field is updated, the others stay at their zero value.
+//
+// TODO(future): for very large group counts, the in-memory map could
+// spill to disk. Out of scope for this prototype — note kept here so
+// the location is obvious when revisiting.
+type groupAccumulator struct {
+	count  uint64  // AggCountStar
+	sumI64 int64   // AggSumColumn over an Int64 column
+	sumF64 float64 // AggSumColumn over a Float64 column
+}
+
+// execGrouped implements ProjGrouped: scan, partition by group key,
+// emit one row per discovered group in insertion order.
+//
+// NaN as a group key is technically pathological because NaN != NaN in
+// Go map keys — distinct NaN bit patterns become distinct groups. Not
+// special-cased; documented here.
+func execGrouped(seg *storage.Segment, schema storage.Schema, q *Query, selection []bool, filtered bool) (*Result, error) {
+	gIdx, ok := schema.ColumnIndex(q.GroupBy)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q (in GROUP BY)", ErrUnknownColumn, q.GroupBy)
+	}
+	gType := schema.Columns[gIdx].Type
+	gCol, err := seg.ReadColumn(q.GroupBy)
+	if err != nil {
+		return nil, fmt.Errorf("query: read group column %q: %w", q.GroupBy, err)
+	}
+
+	var (
+		sumIsInt   bool
+		sumIsFloat bool
+		sumI64s    []int64
+		sumF64s    []float64
+	)
+	if q.GroupAgg == AggSumColumn {
+		sIdx, ok := schema.ColumnIndex(q.SumColumn)
+		if !ok {
+			return nil, fmt.Errorf("%w: %q (in SUM)", ErrUnknownColumn, q.SumColumn)
+		}
+		sType := schema.Columns[sIdx].Type
+		if sType != storage.Int64 && sType != storage.Float64 {
+			return nil, fmt.Errorf("%w: cannot SUM %s column %q", ErrTypeMismatch, sType, q.SumColumn)
+		}
+		sv, err := seg.ReadColumn(q.SumColumn)
+		if err != nil {
+			return nil, fmt.Errorf("query: read sum column %q: %w", q.SumColumn, err)
+		}
+		switch sType {
+		case storage.Int64:
+			sumIsInt = true
+			sumI64s = sv.([]int64)
+		case storage.Float64:
+			sumIsFloat = true
+			sumF64s = sv.([]float64)
+		}
+	}
+
+	keys := make([]any, 0, 16)
+	groups := make(map[any]*groupAccumulator)
+	total := int(seg.RowCount())
+	for i := range total {
+		if filtered && !selection[i] {
+			continue
+		}
+		key := rowValueAt(gCol, i)
+		// Normalize the key under map semantics. int64/float64/string
+		// are all comparable; nothing further is needed. NaN floats
+		// behave as distinct keys — see doc.
+		_ = gType
+		acc, ok := groups[key]
+		if !ok {
+			acc = &groupAccumulator{}
+			groups[key] = acc
+			keys = append(keys, key)
+		}
+		switch q.GroupAgg {
+		case AggCountStar:
+			acc.count++
+		case AggSumColumn:
+			switch {
+			case sumIsInt:
+				newSum, ok := addInt64Checked(acc.sumI64, sumI64s[i])
+				if !ok {
+					return nil, fmt.Errorf("%w: column %q exceeds int64 range in group %v",
+						ErrSumOverflow, q.SumColumn, key)
+				}
+				acc.sumI64 = newSum
+			case sumIsFloat:
+				acc.sumF64 += sumF64s[i]
+			}
+		}
+	}
+
+	// Emit results in discovery order.
+	rows := make([][]any, 0, len(keys))
+	for _, k := range keys {
+		acc := groups[k]
+		var aggVal any
+		switch q.GroupAgg {
+		case AggCountStar:
+			aggVal = acc.count
+		case AggSumColumn:
+			switch {
+			case sumIsInt:
+				aggVal = acc.sumI64
+			case sumIsFloat:
+				aggVal = acc.sumF64
+			}
+		}
+		rows = append(rows, []any{k, aggVal})
+	}
+
+	aggHeader := "COUNT(*)"
+	if q.GroupAgg == AggSumColumn {
+		aggHeader = fmt.Sprintf("SUM(%s)", q.SumColumn)
+	}
+	return &Result{
+		Columns: []string{q.GroupBy, aggHeader},
+		Rows:    rows,
+		// Grouped results are NOT marked aggregate — they're a row set
+		// (one row per group), which is what IsAggregate distinguishes.
+	}, nil
 }
