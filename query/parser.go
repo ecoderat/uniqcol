@@ -66,8 +66,9 @@ func (o FilterOp) String() string {
 	}
 }
 
-// Filter is one comparison applied to one column.
-type Filter struct {
+// Comparison is a leaf in the WHERE expression tree: one column,
+// one operator, one literal value.
+type Comparison struct {
 	Column string
 	Op     FilterOp
 	// Value is whatever literal the parser saw: int64, float64, or
@@ -79,12 +80,30 @@ type Filter struct {
 	Pos int
 }
 
+// FilterExpr is one node in the WHERE expression tree.
+//
+// Invariants (enforced by the parser; relied on by the executor):
+//  1. EXACTLY ONE of Comparison, And, Or is non-nil.
+//  2. And and Or, when non-nil, always have len >= 2. A single-child
+//     And/Or is normalized away by the parser — a lone Comparison is
+//     stored bare so the executor's three-way dispatch never has to
+//     handle a degenerate one-element group.
+//
+// AND binds tighter than OR. The grammar has no parentheses, so the
+// tree is at most two levels deep: typically Or[ And[...], Comp,
+// And[...] ].
+type FilterExpr struct {
+	Comparison *Comparison
+	And        []*FilterExpr
+	Or         []*FilterExpr
+}
+
 // Query is a parsed SELECT statement.
 type Query struct {
 	Projection ProjectionKind
-	Columns    []string // populated for ProjColumns
-	SumColumn  string   // populated for ProjSumColumn
-	Filter     *Filter  // nil if no WHERE
+	Columns    []string    // populated for ProjColumns
+	SumColumn  string      // populated for ProjSumColumn
+	Where      *FilterExpr // nil if no WHERE
 }
 
 // Parse tokenizes and parses input into a Query. Errors include the
@@ -135,6 +154,8 @@ var keywords = map[string]struct{}{
 	"WHERE":  {},
 	"COUNT":  {},
 	"SUM":    {},
+	"AND":    {},
+	"OR":     {},
 	"FROM":   {}, // recognized only so we can reject it with a helpful error
 }
 
@@ -271,13 +292,95 @@ func (p *parser) parseQuery() (*Query, error) {
 	}
 	if t.kind == tkKeyword && t.text == "WHERE" {
 		p.advance()
-		f, err := p.parseFilter()
+		expr, err := p.parseWhere()
 		if err != nil {
 			return nil, err
 		}
-		q.Filter = f
+		q.Where = expr
 	}
 	return q, nil
+}
+
+// parseWhere parses one or more comparisons joined by AND / OR and
+// applies SQL precedence (AND binds tighter than OR). Returns a
+// FilterExpr whose shape is:
+//   - a bare Comparison when there is exactly one condition,
+//   - an And when all operators are AND (length >= 2),
+//   - an Or otherwise, with each child either a single Comparison or
+//     an And group.
+//
+// Parentheses, NOT, and column-to-column comparisons are not supported;
+// each yields a clear parse error rather than a silent misinterpretation.
+func (p *parser) parseWhere() (*FilterExpr, error) {
+	// Pass 1: lex the condition list. comps[i] is joined to comps[i+1]
+	// by ops[i] ("AND" or "OR").
+	var comps []*Comparison
+	var ops []string
+
+	first, err := p.parseComparison()
+	if err != nil {
+		return nil, err
+	}
+	comps = append(comps, first)
+	for {
+		t := p.peek()
+		if t.kind == tkEOF {
+			break
+		}
+		if t.kind == tkKeyword && (t.text == "AND" || t.text == "OR") {
+			p.advance()
+			next, err := p.parseComparison()
+			if err != nil {
+				return nil, err
+			}
+			ops = append(ops, t.text)
+			comps = append(comps, next)
+			continue
+		}
+		// Anything else here is either a normal end-of-WHERE (trailing
+		// junk handled by parseQuery's tail check) or two adjacent
+		// conditions with no operator between them. Catch the latter
+		// explicitly because it's a common mistake.
+		if t.kind == tkIdent {
+			return nil, fmt.Errorf("parse error at position %d: expected comparison operator (=, !=, <, >, <=, >=) or AND/OR before %q",
+				t.pos, t.text)
+		}
+		break
+	}
+
+	// Pass 2: group consecutive AND-joined comparisons.
+	type group struct {
+		members []*Comparison
+	}
+	var groups []group
+	cur := group{members: []*Comparison{comps[0]}}
+	for i, op := range ops {
+		if op == "AND" {
+			cur.members = append(cur.members, comps[i+1])
+		} else {
+			groups = append(groups, cur)
+			cur = group{members: []*Comparison{comps[i+1]}}
+		}
+	}
+	groups = append(groups, cur)
+
+	// Pass 3: lower groups to FilterExpr nodes, then OR-join.
+	groupNodes := make([]*FilterExpr, 0, len(groups))
+	for _, g := range groups {
+		if len(g.members) == 1 {
+			groupNodes = append(groupNodes, &FilterExpr{Comparison: g.members[0]})
+			continue
+		}
+		children := make([]*FilterExpr, len(g.members))
+		for i, c := range g.members {
+			children[i] = &FilterExpr{Comparison: c}
+		}
+		groupNodes = append(groupNodes, &FilterExpr{And: children})
+	}
+	if len(groupNodes) == 1 {
+		return groupNodes[0], nil
+	}
+	return &FilterExpr{Or: groupNodes}, nil
 }
 
 func (p *parser) parseProjection(q *Query) error {
@@ -343,13 +446,23 @@ func (p *parser) parseProjection(q *Query) error {
 	}
 }
 
-func (p *parser) parseFilter() (*Filter, error) {
+// parseComparison parses one leaf `col op literal` predicate. Parens
+// are rejected up front with a specific message — they're not part of
+// the supported grammar.
+func (p *parser) parseComparison() (*Comparison, error) {
 	col := p.advance()
+	if col.kind == tkLParen {
+		return nil, fmt.Errorf("parse error at position %d: parentheses are not supported in WHERE clauses", col.pos)
+	}
 	if col.kind != tkIdent {
 		return nil, fmt.Errorf("parse error at position %d: expected column name after WHERE, got %q", col.pos, displayToken(col))
 	}
 	opTok := p.advance()
 	if opTok.kind != tkOp {
+		// Two adjacent comparisons with no AND/OR between them lands here.
+		if opTok.kind == tkIdent {
+			return nil, fmt.Errorf("parse error at position %d: expected comparison operator (=, !=, <, >, <=, >=) or AND/OR before %q", opTok.pos, opTok.text)
+		}
 		return nil, fmt.Errorf("parse error at position %d: expected comparison operator, got %q", opTok.pos, displayToken(opTok))
 	}
 	op, err := parseOp(opTok.text)
@@ -361,7 +474,7 @@ func (p *parser) parseFilter() (*Filter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Filter{Column: col.text, Op: op, Value: val, Pos: col.pos}, nil
+	return &Comparison{Column: col.text, Op: op, Value: val, Pos: col.pos}, nil
 }
 
 func (p *parser) expectKind(k tokKind, descr string) error {

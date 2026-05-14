@@ -305,3 +305,153 @@ func TestExecute_FilterTypeMismatches(t *testing.T) {
 		})
 	}
 }
+
+// idsOf extracts the id column from a projection-style Result for easy
+// row-set assertions in the multi-condition tests below.
+func idsOf(r *Result) []int64 {
+	out := make([]int64, len(r.Rows))
+	for i, row := range r.Rows {
+		out[i] = row[0].(int64)
+	}
+	return out
+}
+
+func sortedIDs(r *Result) []int64 {
+	got := idsOf(r)
+	// Trivial in-place insertion sort; 5-row fixture, so don't import sort.
+	for i := 1; i < len(got); i++ {
+		for j := i; j > 0 && got[j-1] > got[j]; j-- {
+			got[j-1], got[j] = got[j], got[j-1]
+		}
+	}
+	return got
+}
+
+func TestExecute_AndNarrowsResults(t *testing.T) {
+	seg := buildTestSegment(t)
+	// Fixture: TR rows are {1,3,5}; amount > 20 rows are {3,4,5}.
+	// Intersection: {3, 5}.
+	r, err := Execute(seg, mustParse(t, "SELECT id WHERE country = 'TR' AND amount > 20.0"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := sortedIDs(r)
+	want := []int64{3, 5}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+func TestExecute_OrWidensResults(t *testing.T) {
+	seg := buildTestSegment(t)
+	// country=DE: {4}; amount<15: {1}. Union: {1, 4}.
+	r, err := Execute(seg, mustParse(t, "SELECT id WHERE country = 'DE' OR amount < 15.0"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := sortedIDs(r)
+	want := []int64{1, 4}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+func TestExecute_PrecedenceMatters(t *testing.T) {
+	seg := buildTestSegment(t)
+	// `a AND b OR c` should parse as `(a AND b) OR c`. Choose conditions
+	// so the two groupings would give DIFFERENT row sets:
+	//   a = country='TR'   → {1,3,5}
+	//   b = amount > 20    → {3,4,5}
+	//   c = id = 2         → {2}
+	// (a AND b) OR c    = {3,5} ∪ {2}       = {2,3,5}      ← correct
+	// (a OR b) AND c    = ({1,3,4,5}) ∩ {2} = {}            ← wrong
+	r, err := Execute(seg, mustParse(t,
+		"SELECT id WHERE country = 'TR' AND amount > 20.0 OR id = 2"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := sortedIDs(r)
+	want := []int64{2, 3, 5}
+	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("precedence wrong: got %v; want %v (a AND b) OR c", got, want)
+	}
+}
+
+func TestExecute_RepeatedColumnReference(t *testing.T) {
+	seg := buildTestSegment(t)
+	// id referenced in both conditions. Result: id ∈ {2,3,4}.
+	r, err := Execute(seg, mustParse(t, "SELECT id WHERE id > 1 AND id < 5"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := sortedIDs(r)
+	want := []int64{2, 3, 4}
+	if len(got) != len(want) {
+		t.Fatalf("got %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v; want %v", got, want)
+		}
+	}
+}
+
+func TestExecute_TypeMismatchInSecondCondition(t *testing.T) {
+	seg := buildTestSegment(t)
+	// First condition is fine; second condition has a string literal on
+	// an int64 column. The error must name the right column and carry
+	// the Pos of THAT comparison, not the first one.
+	const sql = "SELECT id WHERE country = 'TR' AND id = 'oops'"
+	_, err := Execute(seg, mustParse(t, sql))
+	if !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("err = %v; want ErrTypeMismatch", err)
+	}
+	if !strings.Contains(err.Error(), `column "id"`) {
+		t.Errorf("err should name column \"id\": %v", err)
+	}
+	// "id" in the second comparison starts at byte 35 of the SQL.
+	if !strings.Contains(err.Error(), "position 35") {
+		t.Errorf("err should anchor to position 35 (second condition): %v", err)
+	}
+}
+
+func TestExecute_CountWithMultiCondition(t *testing.T) {
+	seg := buildTestSegment(t)
+	r, err := Execute(seg, mustParse(t,
+		"SELECT COUNT(*) WHERE country = 'TR' AND amount > 20.0"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !r.IsAggregate() {
+		t.Fatalf("expected aggregate result")
+	}
+	if r.Rows[0][0].(uint64) != 2 {
+		t.Errorf("count = %v; want 2 (rows 3 and 5)", r.Rows[0][0])
+	}
+}
+
+func TestExecute_SumWithMultiCondition(t *testing.T) {
+	seg := buildTestSegment(t)
+	r, err := Execute(seg, mustParse(t,
+		"SELECT SUM(amount) WHERE country = 'TR' OR country = 'US'"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := r.Rows[0][0].(float64)
+	// TR: 10+30+50=90; US: 20; total 110.
+	if got != 110.0 {
+		t.Errorf("sum = %v; want 110.0", got)
+	}
+}
+
+func TestExecute_MalformedFilterExpr(t *testing.T) {
+	// Synthetic malformed expression (all three fields nil). The parser
+	// never produces this; we construct it directly to verify the
+	// defensive error path in evaluate().
+	seg := buildTestSegment(t)
+	q := &Query{Projection: ProjStar, Where: &FilterExpr{}}
+	_, err := Execute(seg, q)
+	if err == nil || !strings.Contains(err.Error(), "malformed FilterExpr") {
+		t.Fatalf("err = %v; want a malformed-FilterExpr error", err)
+	}
+}

@@ -70,26 +70,16 @@ func Execute(seg *storage.Segment, q *Query) (*Result, error) {
 		}
 	}
 
-	// 2. If there's a filter, validate column + literal type.
+	// 2. Evaluate the WHERE expression tree (if any) into a selection
+	// vector. The Segment caches decoded columns internally, so a column
+	// referenced in multiple comparisons is read exactly once.
 	var (
 		selection []bool
 		filtered  bool
 	)
-	if q.Filter != nil {
-		f := q.Filter
-		idx, ok := schema.ColumnIndex(f.Column)
-		if !ok {
-			return nil, fmt.Errorf("%w: %q (in WHERE)", ErrUnknownColumn, f.Column)
-		}
-		colType := schema.Columns[idx].Type
-		if err := checkLiteralType(f, colType); err != nil {
-			return nil, err
-		}
-		v, err := seg.ReadColumn(f.Column)
-		if err != nil {
-			return nil, fmt.Errorf("query: read filter column %q: %w", f.Column, err)
-		}
-		selection, err = applyFilter(v, colType, f)
+	if q.Where != nil {
+		var err error
+		selection, err = evaluate(seg, schema, q.Where)
 		if err != nil {
 			return nil, err
 		}
@@ -109,24 +99,86 @@ func Execute(seg *storage.Segment, q *Query) (*Result, error) {
 	}
 }
 
+// evaluate recursively walks the WHERE expression tree, returning a
+// selection vector of length seg.RowCount(). Leaf nodes read and scan
+// their column; And/Or nodes combine child vectors with bitwise AND/OR.
+//
+// We do NOT short-circuit (e.g. when an OR child evaluates to all-true).
+// The simpler recurse-and-combine approach is correct and adequate for
+// this prototype; short-circuit is a future optimization.
+func evaluate(seg *storage.Segment, schema storage.Schema, e *FilterExpr) ([]bool, error) {
+	switch {
+	case e.Comparison != nil:
+		return evalComparison(seg, schema, e.Comparison)
+	case e.And != nil:
+		acc, err := evaluate(seg, schema, e.And[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range e.And[1:] {
+			next, err := evaluate(seg, schema, child)
+			if err != nil {
+				return nil, err
+			}
+			for i := range acc {
+				acc[i] = acc[i] && next[i]
+			}
+		}
+		return acc, nil
+	case e.Or != nil:
+		acc, err := evaluate(seg, schema, e.Or[0])
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range e.Or[1:] {
+			next, err := evaluate(seg, schema, child)
+			if err != nil {
+				return nil, err
+			}
+			for i := range acc {
+				acc[i] = acc[i] || next[i]
+			}
+		}
+		return acc, nil
+	default:
+		return nil, fmt.Errorf("query: malformed FilterExpr (all branches nil)")
+	}
+}
+
+func evalComparison(seg *storage.Segment, schema storage.Schema, c *Comparison) ([]bool, error) {
+	idx, ok := schema.ColumnIndex(c.Column)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q (in WHERE)", ErrUnknownColumn, c.Column)
+	}
+	colType := schema.Columns[idx].Type
+	if err := checkLiteralType(c, colType); err != nil {
+		return nil, err
+	}
+	v, err := seg.ReadColumn(c.Column)
+	if err != nil {
+		return nil, fmt.Errorf("query: read filter column %q: %w", c.Column, err)
+	}
+	return applyComparison(v, colType, c)
+}
+
 // checkLiteralType ensures the parser's literal type matches the column's
-// declared type. No silent coercion — see Filter doc.
-func checkLiteralType(f *Filter, colType storage.ColumnType) error {
+// declared type. No silent coercion — see Comparison doc.
+func checkLiteralType(c *Comparison, colType storage.ColumnType) error {
 	switch colType {
 	case storage.Int64:
-		if _, ok := f.Value.(int64); !ok {
+		if _, ok := c.Value.(int64); !ok {
 			return fmt.Errorf("%w at position %d: column %q is int64; literal must be int64, got %T",
-				ErrTypeMismatch, f.Pos, f.Column, f.Value)
+				ErrTypeMismatch, c.Pos, c.Column, c.Value)
 		}
 	case storage.Float64:
-		if _, ok := f.Value.(float64); !ok {
+		if _, ok := c.Value.(float64); !ok {
 			return fmt.Errorf("%w at position %d: column %q is float64; literal must be float64 (write e.g. 1.0), got %T",
-				ErrTypeMismatch, f.Pos, f.Column, f.Value)
+				ErrTypeMismatch, c.Pos, c.Column, c.Value)
 		}
 	case storage.String:
-		if _, ok := f.Value.(string); !ok {
+		if _, ok := c.Value.(string); !ok {
 			return fmt.Errorf("%w at position %d: column %q is string; literal must be a single-quoted string, got %T",
-				ErrTypeMismatch, f.Pos, f.Column, f.Value)
+				ErrTypeMismatch, c.Pos, c.Column, c.Value)
 		}
 	default:
 		return fmt.Errorf("query: unsupported column type %s", colType)
@@ -134,20 +186,20 @@ func checkLiteralType(f *Filter, colType storage.ColumnType) error {
 	return nil
 }
 
-func applyFilter(decoded any, colType storage.ColumnType, f *Filter) ([]bool, error) {
+func applyComparison(decoded any, colType storage.ColumnType, c *Comparison) ([]bool, error) {
 	switch colType {
 	case storage.Int64:
 		vals := decoded.([]int64)
-		want := f.Value.(int64)
-		return scanInt64(vals, f.Op, want), nil
+		want := c.Value.(int64)
+		return scanInt64(vals, c.Op, want), nil
 	case storage.Float64:
 		vals := decoded.([]float64)
-		want := f.Value.(float64)
-		return scanFloat64(vals, f.Op, want), nil
+		want := c.Value.(float64)
+		return scanFloat64(vals, c.Op, want), nil
 	case storage.String:
 		vals := decoded.([]string)
-		want := f.Value.(string)
-		return scanString(vals, f.Op, want), nil
+		want := c.Value.(string)
+		return scanString(vals, c.Op, want), nil
 	default:
 		return nil, fmt.Errorf("query: cannot filter on column type %s", colType)
 	}

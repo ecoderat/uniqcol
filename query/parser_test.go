@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -70,19 +71,23 @@ func TestParse_FilterOpsAndLiterals(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			if q.Filter == nil {
-				t.Fatalf("Filter is nil")
+			if q.Where == nil {
+				t.Fatalf("Where is nil")
 			}
-			if q.Filter.Op != tc.wantOp {
-				t.Errorf("Op = %v; want %v", q.Filter.Op, tc.wantOp)
+			c := q.Where.Comparison
+			if c == nil {
+				t.Fatalf("Where is not a bare Comparison: %+v", q.Where)
 			}
-			if q.Filter.Value != tc.wantValue {
+			if c.Op != tc.wantOp {
+				t.Errorf("Op = %v; want %v", c.Op, tc.wantOp)
+			}
+			if c.Value != tc.wantValue {
 				t.Errorf("Value = %v (%T); want %v (%T)",
-					q.Filter.Value, q.Filter.Value, tc.wantValue, tc.wantValue)
+					c.Value, c.Value, tc.wantValue, tc.wantValue)
 			}
-			if q.Filter.Pos == 0 && !strings.HasPrefix(tc.input, "SELECT * WHERE x") {
+			if c.Pos == 0 && !strings.HasPrefix(tc.input, "SELECT * WHERE x") {
 				// at least a sanity check that Pos is being recorded
-				t.Logf("Pos = %d for %q", q.Filter.Pos, tc.input)
+				t.Logf("Pos = %d for %q", c.Pos, tc.input)
 			}
 		})
 	}
@@ -105,8 +110,8 @@ func TestParse_WhitespaceAndCaseInsensitive(t *testing.T) {
 			if len(q.Columns) != 1 || q.Columns[0] != "id" {
 				t.Errorf("Columns = %v; want [id]", q.Columns)
 			}
-			if q.Filter == nil || q.Filter.Column != "x" {
-				t.Errorf("Filter = %+v; want column 'x'", q.Filter)
+			if q.Where == nil || q.Where.Comparison == nil || q.Where.Comparison.Column != "x" {
+				t.Errorf("Where = %+v; want bare Comparison on 'x'", q.Where)
 			}
 		})
 	}
@@ -175,16 +180,173 @@ func TestFilterOp_String(t *testing.T) {
 	}
 }
 
+// shape returns a stable text representation of a FilterExpr tree so
+// tests can assert the exact structure (not just "no parse error").
+//
+// Examples:
+//
+//	Cmp(a=1)
+//	And[ Cmp(a=1), Cmp(b=2) ]
+//	Or[ And[ Cmp(a=1), Cmp(b=2) ], Cmp(c=3) ]
+func shape(e *FilterExpr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Comparison != nil {
+		c := e.Comparison
+		return fmt.Sprintf("Cmp(%s%s%v)", c.Column, c.Op, c.Value)
+	}
+	if e.And != nil {
+		parts := make([]string, len(e.And))
+		for i, ch := range e.And {
+			parts[i] = shape(ch)
+		}
+		return "And[ " + strings.Join(parts, ", ") + " ]"
+	}
+	if e.Or != nil {
+		parts := make([]string, len(e.Or))
+		for i, ch := range e.Or {
+			parts[i] = shape(ch)
+		}
+		return "Or[ " + strings.Join(parts, ", ") + " ]"
+	}
+	return "<empty>"
+}
+
+func TestParse_WhereTreeShape(t *testing.T) {
+	cases := []struct {
+		name      string
+		input     string
+		wantShape string
+	}{
+		{
+			name:      "single condition is a bare Comparison",
+			input:     "SELECT * WHERE a = 1",
+			wantShape: "Cmp(a=1)",
+		},
+		{
+			name:      "two AND",
+			input:     "SELECT * WHERE a = 1 AND b = 2",
+			wantShape: "And[ Cmp(a=1), Cmp(b=2) ]",
+		},
+		{
+			name:      "two OR",
+			input:     "SELECT * WHERE a = 1 OR b = 2",
+			wantShape: "Or[ Cmp(a=1), Cmp(b=2) ]",
+		},
+		{
+			name:      "three AND",
+			input:     "SELECT * WHERE a = 1 AND b = 2 AND c = 3",
+			wantShape: "And[ Cmp(a=1), Cmp(b=2), Cmp(c=3) ]",
+		},
+		{
+			name:      "three OR",
+			input:     "SELECT * WHERE a = 1 OR b = 2 OR c = 3",
+			wantShape: "Or[ Cmp(a=1), Cmp(b=2), Cmp(c=3) ]",
+		},
+		{
+			// AND binds tighter than OR.
+			name:      "mixed AND-then-OR",
+			input:     "SELECT * WHERE a = 1 AND b = 2 OR c = 3",
+			wantShape: "Or[ And[ Cmp(a=1), Cmp(b=2) ], Cmp(c=3) ]",
+		},
+		{
+			name:      "mixed OR-then-AND",
+			input:     "SELECT * WHERE a = 1 OR b = 2 AND c = 3",
+			wantShape: "Or[ Cmp(a=1), And[ Cmp(b=2), Cmp(c=3) ] ]",
+		},
+		{
+			// The case that proves AND-grouping collects MULTIPLE runs,
+			// not just a prefix.
+			name:      "four conditions, AND-OR-AND",
+			input:     "SELECT * WHERE a = 1 AND b = 2 OR c = 3 AND d = 4",
+			wantShape: "Or[ And[ Cmp(a=1), Cmp(b=2) ], And[ Cmp(c=3), Cmp(d=4) ] ]",
+		},
+		{
+			name:      "case insensitive: lowercase and/or",
+			input:     "SELECT * WHERE a = 1 and b = 2 or c = 3",
+			wantShape: "Or[ And[ Cmp(a=1), Cmp(b=2) ], Cmp(c=3) ]",
+		},
+		{
+			name:      "case insensitive: mixed-case And/Or",
+			input:     "SELECT * WHERE a = 1 And b = 2 oR c = 3",
+			wantShape: "Or[ And[ Cmp(a=1), Cmp(b=2) ], Cmp(c=3) ]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.input)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.input, err)
+			}
+			if q.Where == nil {
+				t.Fatalf("Where is nil")
+			}
+			got := shape(q.Where)
+			if got != tc.wantShape {
+				t.Fatalf("tree shape mismatch for %q\n got: %s\nwant: %s",
+					tc.input, got, tc.wantShape)
+			}
+			// Defensive: a top-level And/Or must never have <2 children.
+			assertNoDegenerate(t, q.Where)
+		})
+	}
+}
+
+func assertNoDegenerate(t *testing.T, e *FilterExpr) {
+	t.Helper()
+	if e == nil {
+		return
+	}
+	if e.And != nil && len(e.And) < 2 {
+		t.Fatalf("invariant violated: And with %d children (must be >=2)", len(e.And))
+	}
+	if e.Or != nil && len(e.Or) < 2 {
+		t.Fatalf("invariant violated: Or with %d children (must be >=2)", len(e.Or))
+	}
+	for _, ch := range e.And {
+		assertNoDegenerate(t, ch)
+	}
+	for _, ch := range e.Or {
+		assertNoDegenerate(t, ch)
+	}
+}
+
+func TestParse_MultiConditionErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantSub string
+	}{
+		{"trailing AND", "SELECT a WHERE a = 1 AND", "expected column name"},
+		{"trailing OR", "SELECT a WHERE a = 1 OR", "expected column name"},
+		{"parens rejected", "SELECT * WHERE (a = 1)", "parentheses are not supported"},
+		{"parens after AND", "SELECT * WHERE a = 1 AND (b = 2)", "parentheses are not supported"},
+		{"missing operator between conditions", "SELECT * WHERE a = 1 b = 2", "expected comparison operator (=, !=, <, >, <=, >=) or AND/OR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.input)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error = %q; want substring %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
 func TestParse_FilterPosAnchored(t *testing.T) {
 	q, err := Parse("SELECT * WHERE country = 'TR'")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if q.Filter == nil {
-		t.Fatalf("Filter is nil")
+	if q.Where == nil || q.Where.Comparison == nil {
+		t.Fatalf("Where = %+v; want bare Comparison", q.Where)
 	}
 	// "country" starts at byte offset 15 in "SELECT * WHERE country..."
-	if q.Filter.Pos != 15 {
-		t.Errorf("Filter.Pos = %d; want 15", q.Filter.Pos)
+	if q.Where.Comparison.Pos != 15 {
+		t.Errorf("Comparison.Pos = %d; want 15", q.Where.Comparison.Pos)
 	}
 }
