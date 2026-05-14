@@ -105,7 +105,7 @@ func runLoad(args []string, stdout, stderr io.Writer) int {
 		outPath  = fs.String("out", "", "path to output segment file (required)")
 		pkName   = fs.String("pk", "", "primary-key column name (must appear in --schema) (required)")
 		schema   = fs.String("schema", "", "column schema as col:type,col:type,... using int64|float64|string (required)")
-		expItems = fs.Uint64("expected-items", 1_000_000, "Bloom filter sizing: expected number of unique items")
+		expItems = fs.Uint64("expected-items", 1_000_000, "anticipated number of DISTINCT primary keys the filter will hold (used only for filter sizing — NOT a row-count limit, NOT a duplicate estimate). Filter memory scales linearly with this. Sizing too small causes saturation and false-positive blow-up; too large just wastes memory.")
 		fpr      = fs.Float64("target-fpr", 0.01, "Bloom filter target false-positive rate in (0,1)")
 		noBloom  = fs.Bool("no-bloom", false, "disable the Bloom filter; segment is written without a trailer (write/benchmark only)")
 	)
@@ -125,6 +125,15 @@ func runLoad(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "load: --csv, --out, --pk and --schema are required")
 		fs.Usage()
 		return 1
+	}
+
+	// Pre-flight: warn (don't fail) if the user has under-sized the
+	// filter. 1000 is arbitrary but below this almost any real dataset
+	// saturates the BF immediately.
+	if !*noBloom && *expItems < 1000 {
+		fmt.Fprintf(stderr,
+			"warning: --expected-items=%d is very small; filter may saturate.\nConsider 10x the number of distinct PKs you expect to see.\n",
+			*expItems)
 	}
 
 	cols, err := parseSchemaSpec(*schema)
@@ -258,6 +267,18 @@ func runLoad(args []string, stdout, stderr io.Writer) int {
 	}
 
 	stats := tbl.Stats()
+	estFPR := estimatedFPR(tbl)
+
+	// Post-load: warn if the filter's actual estimated FPR is more than
+	// 2x the target. This catches the "sized correctly per the contract,
+	// but the contract was wrong for this input" case (e.g., the real
+	// dataset had more distinct PKs than --expected-items allowed for).
+	if !*noBloom && estFPR > 2*(*fpr) {
+		fmt.Fprintf(stderr,
+			"warning: estimated FPR (%.2f%%) exceeds target (%.2f%%) by >2x.\nFilter may be saturated; consider raising --expected-items.\n",
+			estFPR*100, (*fpr)*100)
+	}
+
 	printLoadSummary(stdout, loadSummary{
 		rowsRead:      rowsRead,
 		accepted:      stats.Accepted,
@@ -265,7 +286,7 @@ func runLoad(args []string, stdout, stderr io.Writer) int {
 		parseErrors:   parseErrors,
 		elapsed:       elapsed,
 		bloomDisabled: *noBloom,
-		estimatedFPR:  estimatedFPR(tbl),
+		estimatedFPR:  estFPR,
 		segmentBytes:  segSize,
 	})
 	return 0

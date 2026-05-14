@@ -362,3 +362,63 @@ func TestRunLoad_UnknownFlag(t *testing.T) {
 		t.Fatalf("expected non-zero exit on unknown flag")
 	}
 }
+
+// TestRunLoad_SmallExpectedItemsWarning fires the pre-flight warning by
+// asking for a too-tight filter. The load itself must still succeed.
+// Inputs sized so the post-load saturation warning does NOT also fire,
+// which would muddy what this test asserts.
+func TestRunLoad_SmallExpectedItemsWarning(t *testing.T) {
+	dir := t.TempDir()
+	csvPath, _ := buildEventsCSV(t, dir, 5, 0) // tiny CSV, 5 unique rows
+	outPath := filepath.Join(dir, "out.uniq")
+
+	var stdout, stderr bytes.Buffer
+	code := runLoad([]string{
+		"--csv", csvPath,
+		"--out", outPath,
+		"--pk", "event_id",
+		"--schema", "event_id:int64,user_id:int64,amount:float64,country:string",
+		"--expected-items", "100",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("load should still succeed; exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--expected-items=100 is very small") {
+		t.Errorf("stderr missing pre-flight warning:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "may saturate") {
+		t.Errorf("stderr missing 'may saturate' hint:\n%s", stderr.String())
+	}
+}
+
+// TestRunLoad_SaturationWarning over-fills a correctly-sized-by-flag
+// filter (expected-items=1000 → no pre-flight) with 2000 distinct PKs so
+// the actual estimated FPR climbs past 2x the target.
+func TestRunLoad_SaturationWarning(t *testing.T) {
+	dir := t.TempDir()
+	csvPath, _ := buildEventsCSV(t, dir, 2000, 0)
+	outPath := filepath.Join(dir, "out.uniq")
+
+	var stdout, stderr bytes.Buffer
+	code := runLoad([]string{
+		"--csv", csvPath,
+		"--out", outPath,
+		"--pk", "event_id",
+		"--schema", "event_id:int64,user_id:int64,amount:float64,country:string",
+		"--expected-items", "1000", // not < 1000, so pre-flight stays quiet
+		"--target-fpr", "0.01",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("load should still succeed; exit=%d stderr=%q", code, stderr.String())
+	}
+	se := stderr.String()
+	if strings.Contains(se, "is very small") {
+		t.Errorf("pre-flight warning should NOT fire at expected-items=1000:\n%s", se)
+	}
+	if !strings.Contains(se, "exceeds target") {
+		t.Errorf("stderr missing saturation warning:\n%s", se)
+	}
+	if !strings.Contains(se, "consider raising --expected-items") {
+		t.Errorf("stderr missing remediation hint:\n%s", se)
+	}
+}

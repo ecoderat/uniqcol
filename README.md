@@ -112,24 +112,40 @@ go build -o uniqcol ./cmd/uniqcol
 ### Programatik Kullanım (Go)
 
 ```go
-import "github.com/ecoderat/uniqcol"
+import (
+    "os"
 
-table, _ := uniqcol.Create("events.uniq", uniqcol.Schema{
+    "github.com/ecoderat/uniqcol/query"
+    "github.com/ecoderat/uniqcol/storage"
+)
+
+schema := storage.Schema{
     PK: "event_id",
-    Columns: []uniqcol.Column{
-        {Name: "event_id", Type: uniqcol.Int64},
-        {Name: "user_id",  Type: uniqcol.Int64},
-        {Name: "amount",   Type: uniqcol.Float64},
-        {Name: "country",  Type: uniqcol.String},
+    Columns: []storage.Column{
+        {Name: "event_id", Type: storage.Int64},
+        {Name: "user_id",  Type: storage.Int64},
+        {Name: "amount",   Type: storage.Float64},
+        {Name: "country",  Type: storage.String},
     },
-    BloomFPR: 0.01,
+}
+tbl, _ := storage.CreateTable(schema, storage.TableOptions{
+    BloomExpectedItems: 1_000_000,
+    BloomTargetFPR:     0.01,
 })
-defer table.Close()
 
-table.Insert(uniqcol.Row{1001, 42, 19.99, "TR"})
-table.Insert(uniqcol.Row{1001, 42, 19.99, "TR"}) // reddedilir
+tbl.Insert(storage.Row{int64(1001), int64(42), 19.99, "TR"})
+tbl.Insert(storage.Row{int64(1001), int64(42), 19.99, "TR"}) // reddedilir (BF)
 
-count := table.Query().Where("country", "==", "TR").Count()
+f, _ := os.Create("events.uniq")
+_ = tbl.Flush(f)
+_ = f.Close()
+
+seg, _ := storage.OpenSegment("events.uniq")
+defer seg.Close()
+
+q, _ := query.Parse("SELECT amount WHERE country = 'TR'")
+result, _ := query.Execute(seg, q)
+_ = result // result.Columns, result.Rows
 ```
 
 ---
@@ -304,6 +320,65 @@ seçeceği için bunun kadar veya bundan hızlı olmalıdır).
   ölçülmektedir. Gerçek disk ilk-okuması çok daha yavaş olacaktır;
   bu özellikle mmap geçişi için bir TODO olarak `segment.go`'da
   belirtilmiştir.
+
+---
+
+## Gerçek Veri Üzerinde Doğrulama
+
+Sentetik benchmark'ların yanında, motorun gerçek veride nasıl
+davrandığını görmek için Kaggle'da yayınlanan bir e-ticaret veriseti
+(541,909 satır, 25,900 unique `InvoiceNo`) üzerinde uçtan uca test
+edildi.
+
+### Bulgular
+
+| Metrik             | Değer        | Yorum                                                  |
+|--------------------|--------------|--------------------------------------------------------|
+| Toplam satır       | 541,909      | Veriseti boyutu                                        |
+| Unique `InvoiceNo` | 25,900       | Beklenen kabul edilecek kayıt sayısı                   |
+| Kabul edilen       | 25,900       | Tam eşleşme — sıfır false negative                     |
+| Reddedilen (BF)    | 516,009      | %95.22 — verisetinin gerçek duplicate oranı            |
+| Yükleme süresi     | 149 ms       | ~3.6 M satır/sn throughput (uçtan uca, parse dahil)    |
+| Segment boyutu     | 2.6 MB       | ~1.14 MB Bloom trailer + ~1.46 MB kolon payload        |
+| `m` (BF bit sayısı)| 9,585,059    | `inspect` çıktısından doğrulandı                       |
+| `k` (hash sayısı)  | 7            | Kirsch–Mitzenmacher (FNV-1a 128, ikili hash)           |
+| Tahmini FPR        | 0.00000      | %1 hedef; kapasite altında olduğundan ~0               |
+
+### Operasyonel Gözlem: Parametre Hassasiyeti
+
+İlk denemede `--expected-items` parametresi "beklenen duplicate sayısı"
+olarak yanlış yorumlandı ve `1,000,000` yerine küçük bir değer girildi.
+Bunun sonucunda Bloom filter erken doyma noktasına ulaştı; sonraki
+unique kayıtların büyük kısmı false positive ile reddedildi ve 25,900
+unique kayıttan yalnızca **9,493**'ü hayatta kaldı (~%63 unique data
+kaybı). Doğru parametre (`--expected-items 1000000`, `--target-fpr
+0.01`) ile yeniden çalıştırıldığında tüm 25,900 unique kayıt eksiksiz
+yakalandı.
+
+Bu gözlem iki konuda somut girdi sağladı:
+
+1. **CLI UX'i sertleştirildi.** `--expected-items` bayrağının açıklaması
+   "beklenen duplicate sayısı / kabul edilecek satır sayısı" gibi yanlış
+   yorumları engelleyecek şekilde yeniden yazıldı. Ayrıca iki uyarı
+   eklendi: (a) `--expected-items < 1000` ise yükleme öncesinde, (b)
+   tahmini FPR hedefin >2 katına çıkarsa yükleme sonrasında stderr'e
+   tek satırlık uyarı basılır — yükleme kesilmez, ama tanı kullanıcıya
+   açık edilir.
+2. **"Gelecek Çalışmalar" listesindeki partitioned Bloom filter
+   maddesinin gerekçesi güçlendi.** Segment başına bağımsız ve büyüme
+   sırasında yeniden boyutlandırılabilen filterlar, tek-parametreli
+   tasarımın bu hassasiyetini operasyonel olarak çözer.
+
+### Kolon Bazlı Sıkıştırma Davranışı
+
+Gerçek veri profili, sentetik benchmark tablolarındaki RLE bulgularıyla
+nitel olarak örtüşmektedir. Kategorik / düşük kardinaliteli kolonlar
+RLE'den faydalanır; tamamen unique veya yüksek-kardinaliteli string
+kolonları yine değer başına 1 baytlık uvarint overhead'ı öder ve
+sıkışmaz. Bu, dictionary encoding'in (bkz. *Gelecek Çalışmalar*) tipik
+analitik veride sağlayacağı kazancın somut göstergesidir: özellikle
+ürün açıklamaları gibi tekrar eden ama uzun string kolonları, dictionary
+ile RLE'den çok daha verimli kodlanır.
 
 ---
 
